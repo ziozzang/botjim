@@ -113,10 +113,16 @@ func (r *Registry) FileDoneBytes(id uint32, n int64) {
 	r.mu.Unlock()
 }
 
-// FileStateUpdate sets a file's state string ("wait", "active", "done", "error", "skipped").
+// FileStateUpdate sets a file's state string ("wait", "active", "done",
+// "error", "skipped"). Same-state updates are no-ops so hot paths can set
+// "active" on every chunk.
 func (r *Registry) FileStateUpdate(id uint32, state, errMsg string) {
 	r.mu.Lock()
 	if f, ok := r.files[id]; ok {
+		if f.state == state && state == "active" {
+			r.mu.Unlock()
+			return
+		}
 		f.state = state
 		f.err = errMsg
 		if state == "done" {
@@ -168,19 +174,23 @@ func (r *Registry) Snapshot() Snapshot {
 	}
 
 	r.mu.RLock()
-	// keep the ~24 most recently active files for the TUI
-	s.Files = make([]FileState, 0, len(r.order))
-	for i := len(r.order) - 1; i >= 0 && len(s.Files) < 24; i-- {
-		id := r.order[i]
-		if f, ok := r.files[id]; ok && f.state != "done" && f.state != "skipped" {
-			s.Files = append(s.Files, FileState{ID: id, Path: f.path, Size: f.size, Done: f.done, State: f.state, Err: f.err})
+	// TUI file table: in-flight files first (the ones actually moving),
+	// then queued ones newest-first, then errors — capped so million-file
+	// trees stay cheap.
+	s.Files = make([]FileState, 0, 24)
+	for pass := 0; pass < 3; pass++ {
+		want := "active"
+		cap24 := 12
+		if pass == 1 {
+			want, cap24 = "wait", 24
+		} else if pass == 2 {
+			want, cap24 = "error", 48
 		}
-	}
-	// include errors always
-	for i := len(r.order) - 1; i >= 0 && len(s.Files) < 48; i-- {
-		id := r.order[i]
-		if f, ok := r.files[id]; ok && f.state == "error" {
-			s.Files = append(s.Files, FileState{ID: id, Path: f.path, Size: f.size, Done: f.done, State: f.state, Err: f.err})
+		for i := len(r.order) - 1; i >= 0 && len(s.Files) < cap24; i-- {
+			id := r.order[i]
+			if f, ok := r.files[id]; ok && f.state == want {
+				s.Files = append(s.Files, FileState{ID: id, Path: f.path, Size: f.size, Done: f.done, State: f.state, Err: f.err})
+			}
 		}
 	}
 	r.mu.RUnlock()
@@ -189,7 +199,7 @@ func (r *Registry) Snapshot() Snapshot {
 	r.rateMu.Lock()
 	sent := s.SentBytes
 	r.rateHist = append(r.rateHist, ratePoint{at: now, sent: sent})
-	cutoff := now.Add(-8 * time.Second)
+	cutoff := now.Add(-4 * time.Second) // short window: the number should feel live
 	drop := 0
 	for drop < len(r.rateHist) && r.rateHist[drop].at.Before(cutoff) {
 		drop++

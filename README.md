@@ -17,8 +17,8 @@ $ botjim -c 1.2.3.4                            # no paths: MC-style picker TUI
 - **Chunk-parallel** — a single file is split into 4/8/16MiB chunks fanned out over N streams (`--parallel`, default 8) multiplexed on one TCP connection (yamux).
 - **Resume** — the receiver keeps `<name>.fs-part-<nonce>` plus a sidecar (per-chunk hash bitmap); a re-run re-hashes what's on disk and only fetches the gaps. Verified by a kill -9 suite; a completed file costs 0 bytes on re-run.
 - **Compression** — per-chunk zstd (default) / lz4 / none, with automatic raw fallback for incompressible data.
-- **TUI** — btop-style server dashboard (braille sparkline throughput, per-connection progress, log tail) and a client progress view (bar, rate, ETA); single-line fallback in pipes.
-- **MC-style browser** — run with no paths to pick files with space/enter midnight-commander-style; pull mode browses the server's directories remotely.
+- **TUI** — btop-style server dashboard (braille sparkline throughput, per-connection and per-file rate/ETA, log tail) and a client progress view (bar, live rate, global and per-file ETA, rolling transfer log); single-line fallback in pipes.
+- **MC-style browser** — run with no paths to pick files midnight-commander-style: space marks, `/` regex-filters (with match highlighting), the list scrolls (PgUp/PgDn/g/G) and colors distinguish dirs/symlinks/executables; pull mode browses the server remotely.
 - **Self-update** — `botjim update` replaces the binary from GitHub Releases after SHA256SUMS verification.
 
 ## Install

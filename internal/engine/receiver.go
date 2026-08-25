@@ -1063,6 +1063,9 @@ func (r *Receiver) okEntry(e manifest.Entry, _ string) {
 	r.report.Bytes += uint64(e.Size)
 	r.resolved++
 	r.mu.Unlock()
+	if e.Kind == manifest.KindRegular {
+		r.reg.Emit("file-done", e.RelPath, "")
+	}
 	_ = r.ctrl.Send(protocol.MsgFileResult, 0, protocol.FileResult{FileID: e.ID, Status: protocol.ResultOK}.Encode())
 	r.kickCompletion()
 }
@@ -1076,6 +1079,7 @@ func (r *Receiver) okEntryLocked(f *rxFile, e manifest.Entry) {
 		r.resolved++
 	}
 	r.mu.Unlock()
+	r.reg.Emit("file-done", e.RelPath, "")
 	_ = r.ctrl.Send(protocol.MsgFileResult, 0, protocol.FileResult{FileID: e.ID, Status: protocol.ResultOK}.Encode())
 	r.kickCompletion()
 }
@@ -1090,6 +1094,7 @@ func (r *Receiver) failEntry(e manifest.Entry, code uint16, msg string) {
 	}
 	r.mu.Unlock()
 	r.reg.FileStateUpdate(e.ID, "error", msg)
+	r.reg.Emit("file-error", e.RelPath, msg)
 	_ = r.ctrl.Send(protocol.MsgFileResult, 0, protocol.FileResult{FileID: e.ID, Status: protocol.ResultError, Code: code, Msg: msg}.Encode())
 	r.kickCompletion()
 }
@@ -1110,6 +1115,7 @@ func (r *Receiver) failFile(f *rxFile, code uint16, msg string) {
 		f.part = nil
 	}
 	r.reg.FileStateUpdate(f.entry.ID, "error", msg)
+	r.reg.Emit("file-error", f.entry.RelPath, msg)
 	_ = r.ctrl.Send(protocol.MsgFileResult, 0, protocol.FileResult{FileID: f.entry.ID, Status: protocol.ResultError, Code: code, Msg: msg}.Encode())
 	r.kickCompletion()
 }

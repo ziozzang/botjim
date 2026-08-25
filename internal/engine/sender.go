@@ -428,17 +428,21 @@ func (s *Sender) fileResult(m protocol.FileResult) {
 			f.errored = true
 			s.report.Errors = append(s.report.Errors, FileError{Path: f.entry.RelPath, Code: m.Code, Msg: m.Msg})
 			s.reg.FileStateUpdate(f.entry.ID, "error", m.Msg)
+			s.reg.Emit("file-error", f.entry.RelPath, m.Msg)
 		} else if !f.resolved {
 			s.report.Files++
 			if m.Status == protocol.ResultSkip {
 				s.reg.FileStateUpdate(f.entry.ID, "skipped", "")
+				s.reg.Emit("file-skip", f.entry.RelPath, "already at destination")
 			} else {
 				s.reg.FileStateUpdate(f.entry.ID, "done", "")
+				s.reg.Emit("file-done", f.entry.RelPath, "")
 			}
 		}
 	} else {
 		if m.Status != protocol.ResultError {
 			s.report.Files++
+			s.reg.Emit("file-done", fmt.Sprintf("entry#%d", m.FileID), "")
 		}
 		s.reg.FileStateUpdate(m.FileID, "done", "")
 	}
@@ -518,6 +522,7 @@ func (s *Sender) failFile(f *txFile, code uint16, msg string) {
 	s.resolved++
 	s.report.Errors = append(s.report.Errors, FileError{Path: f.entry.RelPath, Code: code, Msg: msg})
 	s.reg.FileStateUpdate(f.entry.ID, "error", msg)
+	s.reg.Emit("file-error", f.entry.RelPath, msg)
 	s.mu.Unlock()
 	_ = s.ctrl.Send(protocol.MsgFileResult, 0,
 		protocol.FileResult{FileID: f.entry.ID, Status: protocol.ResultError, Code: code, Msg: msg}.Encode())
@@ -707,6 +712,7 @@ func (s *Sender) sendChunk(ctx context.Context, ds *protocol.DataStream, codec c
 	if s.opts.Preserve&protocol.PreserveSparse != 0 && isAllZero(raw) {
 		s.reg.AddSent(n)
 		s.reg.FileDoneBytes(e.ID, n)
+		s.reg.FileStateUpdate(e.ID, "active", "")
 		return ds.WriteChunk(protocol.ChunkHeader{FileID: e.ID, ChunkIdx: uint64(task.idx), Flags: protocol.ChunkFlagZero, PayloadLen: 0}, nil)
 	}
 	if codec != nil {
@@ -724,6 +730,7 @@ func (s *Sender) sendChunk(ctx context.Context, ds *protocol.DataStream, codec c
 	}
 	s.reg.AddSent(n)
 	s.reg.FileDoneBytes(e.ID, n)
+	s.reg.FileStateUpdate(e.ID, "active", "")
 	return ds.WriteChunk(protocol.ChunkHeader{FileID: e.ID, ChunkIdx: uint64(task.idx), Flags: flags, PayloadLen: uint64(len(payload))}, payload)
 }
 
