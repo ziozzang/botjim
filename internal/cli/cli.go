@@ -27,6 +27,7 @@ import (
 	"github.com/ziozzang/botjim/internal/fsutil"
 	"github.com/ziozzang/botjim/internal/protocol"
 	"github.com/ziozzang/botjim/internal/session"
+	"github.com/ziozzang/botjim/internal/transport"
 	"github.com/ziozzang/botjim/internal/version"
 )
 
@@ -256,7 +257,7 @@ func runServer(ctx context.Context, f *flags) error {
 	if err != nil {
 		return err
 	}
-	ln, err := net.Listen("tcp", bind)
+	ln, err := transport.Listen(bind)
 	if err != nil {
 		return err
 	}

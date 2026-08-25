@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"syscall"
 	"time"
 
 	"github.com/hashicorp/yamux"
@@ -24,12 +25,36 @@ type CipherFunc func(net.Conn) (net.Conn, error)
 // IdentityCipher passes the connection through untouched.
 func IdentityCipher(c net.Conn) (net.Conn, error) { return c, nil }
 
+// tuneSocket raises TCP buffer ceilings so long-fat links can actually
+// fill (Linux autotuning grows into these caps). Best-effort: failures
+// (container restrictions, non-Linux) are ignored.
+func tuneSocket(network, addr string, c syscall.RawConn) error {
+	return c.Control(func(fd uintptr) {
+		for _, size := range []int{8 << 20, 4 << 20, 1 << 20} {
+			if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, size); err == nil {
+				break
+			}
+		}
+		for _, size := range []int{8 << 20, 4 << 20, 1 << 20} {
+			if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, size); err == nil {
+				break
+			}
+		}
+	})
+}
+
+// Listen starts a TCP listener with the same socket tuning as Dial.
+func Listen(addr string) (net.Listener, error) {
+	lc := net.ListenConfig{Control: tuneSocket}
+	return lc.Listen(context.Background(), "tcp", addr)
+}
+
 // Yamux tuning: a large per-stream window matters on long-fat networks
 // (yamux's initial window is 256KiB; it grows to this ceiling), and a deep
 // accept backlog absorbs N parallel data streams opening at once.
 func muxConfig() *yamux.Config {
 	cfg := yamux.DefaultConfig()
-	cfg.MaxStreamWindowSize = 4 << 20
+	cfg.MaxStreamWindowSize = 16 << 20
 	cfg.AcceptBacklog = 256
 	cfg.EnableKeepAlive = true
 	cfg.KeepAliveInterval = 30 * time.Second
@@ -48,7 +73,7 @@ func Dial(ctx context.Context, addr string, features uint64, cipher CipherFunc) 
 	if cipher == nil {
 		cipher = IdentityCipher
 	}
-	d := net.Dialer{Timeout: 15 * time.Second}
+	d := net.Dialer{Timeout: 15 * time.Second, Control: tuneSocket}
 	raw, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err

@@ -6,7 +6,8 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$ROOT/botjim"
 WORK="/tmp/botjim-bench.$$"
-PORT=14780
+PORTBASE=14790
+PORT=$PORTBASE
 mkdir -p "$WORK"
 
 cleanup() {
@@ -56,25 +57,36 @@ rate() { # rate <label> <bytes> <t0> <t1>
   python3 -c "print(f'  $1: {$4-$t0_mark:.2f}s')" 2>/dev/null || true
 }
 
-bench() { # bench <label> <dir> <size> <args...>
+BPORT=15100
+bench() { # bench <label> <dir> <size> <args...> — isolated server per case
   local label="$1" dir="$2" size="$3"; shift 3
-  rm -rf "$WORK/dst"; mkdir -p "$WORK/dst"
-  local t0=$(date +%s.%N)
-  ( cd "$dir" && "$BIN" -c 127.0.0.1:$PORT --no-tui -q "$@" . ) >/dev/null 2>&1
-  local rc=$?
-  local t1=$(date +%s.%N)
-  if [ $rc -ne 0 ]; then echo "$label: FAILED"; return; fi
+  local dst rc t0 t1
+  dst="$WORK/dst-$(basename "$dir")-$$-$BPORT"
+  mkdir -p "$dst"
+  BPORT=$((BPORT+1))
+  ( cd "$WORK" && setsid "$BIN" -s --root "$dst" -p $((BPORT-1)) --no-tui > "srv-$BPORT.log" 2>&1 & )
+  for _ in $(seq 1 50); do ss -tln | grep -q ":$((BPORT-1)) " && break; sleep 0.1; done
+  t0=$(date +%s.%N)
+  ( cd "$dir" && "$BIN" -c 127.0.0.1:$((BPORT-1)) --no-tui -q "$@" . ) >/tmp/bench.err 2>&1
+  rc=$?
+  t1=$(date +%s.%N)
+  [ $rc -ne 0 ] && { echo "$label FAILED:"; tail -2 /tmp/bench.err; }
+  local SP; SP=$(ss -tlnp 2>/dev/null | grep ":$((BPORT-1)) " | grep -oP 'pid=\K[0-9]+' | head -1)
+  [ -n "$SP" ] && kill "$SP" 2>/dev/null
+  if [ $rc -ne 0 ]; then echo "$label: FAILED"; rm -rf "$dst"; return; fi
   python3 -c "print(f'$label: {$t1-$t0:.2f}s  {$size/($t1-$t0)/1024/1024:.0f} MiB/s')"
+  rm -rf "$dst" &
 }
 
 tarbench() { # tarbench <label> <dir> <size>
   local label="$1" dir="$2" size="$3"
   rm -rf "$WORK/tardst"; mkdir -p "$WORK/tardst"
-  pkill -f "nc -l .* $PORT" 2>/dev/null; sleep 0.2
-  ( cd "$WORK/tardst" && setsid nc -l -p $PORT | tar x >/dev/null 2>&1 & )
-  sleep 0.3
+  pkill -f "nc -l " 2>/dev/null
+  local TP=$((PORTBASE + 1000 + RANDOM % 500)) # fresh port: listeners TIME_WAIT
+  ( cd "$WORK/tardst" && setsid nc -l -p $TP | tar x >/dev/null 2>&1 & )
+  for _ in $(seq 1 40); do ss -tln | grep -q ":$TP" && break; sleep 0.1; done
   local t0=$(date +%s.%N)
-  ( cd "$dir" && tar cf - . | nc -q 2 127.0.0.1 $PORT ) >/dev/null 2>&1
+  ( cd "$dir" && tar cf - . | nc -q 2 127.0.0.1 $TP ) >/dev/null 2>&1
   local t1=$(date +%s.%N)
   pkill -f "nc -l .* $PORT" 2>/dev/null
   python3 -c "print(f'$label: {$t1-$t0:.2f}s  {$size/($t1-$t0)/1024/1024:.0f} MiB/s')"
