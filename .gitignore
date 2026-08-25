@@ -1,0 +1,5 @@
+go build: artifacts ignore
+/botjim
+/dist/
+*.test
+*.out
