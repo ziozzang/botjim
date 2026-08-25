@@ -296,7 +296,10 @@ func (s *Sender) readCtrl(ctx context.Context, cancel context.CancelFunc) {
 	for {
 		f, err := s.ctrl.Recv(buf)
 		if err != nil {
-			if ctx.Err() == nil {
+			s.mu.Lock()
+			complete := s.emitted > 0 && s.resolved >= s.emitted
+			s.mu.Unlock()
+			if ctx.Err() == nil && !complete {
 				s.setFatal(fmt.Errorf("control stream: %w", err))
 			}
 			cancel()

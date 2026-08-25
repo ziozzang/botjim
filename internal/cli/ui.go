@@ -10,55 +10,97 @@ import (
 
 	"github.com/ziozzang/botjim/internal/progress"
 	"github.com/ziozzang/botjim/internal/session"
+	"github.com/ziozzang/botjim/internal/tui"
 )
 
-// clientUI is the progress front-end for a client run. The TUI replaces the
-// renderer when stderr is a terminal and --no-tui is absent; otherwise a
-// single refresh line does the job (pipes get one summary line at the end).
+// clientUI is the progress front-end for a client run: the full TUI on a
+// terminal, a single refresh line under --no-tui, nothing under -q. It owns
+// the main goroutine for the TUI case (the engine runs underneath).
 type clientUI struct {
-	reg     *progress.Registry
-	pull    bool
-	f       *flags
-	ticker  *time.Ticker
-	stop    chan struct{}
-	done    chan struct{}
-	lastLen int
+	reg  *progress.Registry
+	pull bool
+	f    *flags
+	line *lineUI
 }
 
 func newClientUI(f *flags, reg *progress.Registry, pull bool) *clientUI {
-	return &clientUI{reg: reg, pull: pull, f: f, stop: make(chan struct{}), done: make(chan struct{})}
+	return &clientUI{reg: reg, pull: pull, f: f}
 }
 
-func (u *clientUI) Run(ctx context.Context) {
-	interval := 250 * time.Millisecond
-	if u.f.quiet || !stderrIsTerminal() || u.f.noTUI {
-		if u.f.quiet {
-			close(u.done)
-			return
-		}
+// Run drives the UI while call runs in a goroutine; it returns when call
+// finishes or (TUI only) the user quits early — in that case the context is
+// cancelled so call unwinds.
+func (u *clientUI) Run(ctx context.Context, cancel context.CancelFunc, call func() session.ClientResult) session.ClientResult {
+	if u.f.quiet {
+		return call()
 	}
-	u.ticker = time.NewTicker(interval)
+	if !stderrIsTerminal() || u.f.noTUI {
+		lu := newLineUI(u)
+		lu.Run(ctx)
+		res := call()
+		lu.Close()
+		return res
+	}
+	resCh := make(chan session.ClientResult, 1)
+	go func() { resCh <- call() }()
+	done := make(chan error, 1)
 	go func() {
-		defer close(u.done)
-		defer u.ticker.Stop()
+		res := <-resCh
+		done <- res.Err
+	}()
+	_ = tui.RunClientProgress(ctx, u.reg, u.pull, done)
+	// if the TUI exited before the transfer finished, the user quit: abort
+	select {
+	case res := <-resCh:
+		return res
+	default:
+		cancel()
+		res := <-resCh
+		return res
+	}
+}
+
+// lineUI is the --no-tui single-line progress renderer.
+type lineUI struct {
+	u        *clientUI
+	ticker   *time.Ticker
+	stop     chan struct{}
+	done     chan struct{}
+	lastLen  int
+	finished bool
+}
+
+func newLineUI(u *clientUI) *lineUI {
+	return &lineUI{u: u, stop: make(chan struct{}), done: make(chan struct{})}
+}
+
+func (l *lineUI) Run(ctx context.Context) {
+	if !stderrIsTerminal() {
+		close(l.done)
+		return
+	}
+	l.ticker = time.NewTicker(250 * time.Millisecond)
+	go func() {
+		defer close(l.done)
+		defer l.ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-u.stop:
+			case <-l.stop:
 				return
-			case <-u.ticker.C:
-				u.render()
+			case <-l.ticker.C:
+				l.render()
 			}
 		}
 	}()
 }
 
-func (u *clientUI) render() {
-	s := u.reg.Snapshot()
-	direction := "↑ push"
-	if u.pull {
-		direction = "↓ pull"
+func (l *lineUI) render() {
+	s := l.u.reg.Snapshot()
+	direction := "↑"
+	if l.u.pull {
+		direction = "↓"
 	}
 	var b strings.Builder
 	pct := 0.0
@@ -71,26 +113,26 @@ func (u *clientUI) render() {
 	if s.Scanning {
 		b.WriteString(" (scanning…)")
 	}
-	if n := len(b.String()); n < u.lastLen {
-		b.WriteString(strings.Repeat(" ", u.lastLen-n))
+	if n := len(b.String()); n < l.lastLen {
+		b.WriteString(strings.Repeat(" ", l.lastLen-n))
 	} else {
-		u.lastLen = n
+		l.lastLen = n
 	}
 	fmt.Fprint(os.Stderr, b.String())
 }
 
-func (u *clientUI) Close() {
-	if u.ticker != nil {
-		u.ticker.Stop()
+func (l *lineUI) Close() {
+	if l.ticker != nil {
+		l.ticker.Stop()
 	}
 	select {
-	case <-u.stop:
+	case <-l.stop:
 	default:
-		close(u.stop)
+		close(l.stop)
 	}
-	<-u.done
-	if u.lastLen > 0 {
-		fmt.Fprint(os.Stderr, "\r"+strings.Repeat(" ", u.lastLen)+"\r")
+	<-l.done
+	if l.lastLen > 0 {
+		fmt.Fprint(os.Stderr, "\r"+strings.Repeat(" ", l.lastLen)+"\r")
 	}
 }
 
@@ -107,52 +149,24 @@ func fmtETA(d time.Duration) string {
 	return fmt.Sprintf("%ds", int(d.Seconds()))
 }
 
-// serverUI is the server-side front-end: plain log lines for now; the btop
-// dashboard takes over on terminals.
+// serverUI is the server front-end: the btop dashboard on a terminal, plain
+// lines otherwise. It owns the main goroutine when active.
 type serverUI struct {
-	srv  *session.Server
-	f    *flags
-	stop chan struct{}
-	done chan struct{}
+	srv *session.Server
+	f   *flags
 }
 
 func newServerUI(srv *session.Server, f *flags) *serverUI {
-	return &serverUI{srv: srv, f: f, stop: make(chan struct{}), done: make(chan struct{})}
+	return &serverUI{srv: srv, f: f}
 }
 
+// Run blocks until the server should stop (user quit or context death).
 func (u *serverUI) Run(ctx context.Context) {
 	if u.f.quiet || !stderrIsTerminal() || u.f.noTUI {
-		close(u.done)
+		<-ctx.Done()
 		return
 	}
-	u.renderStatic()
-	go func() {
-		defer close(u.done)
-		t := time.NewTicker(1 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-u.stop:
-				return
-			case <-t.C:
-			}
-		}
-	}()
-}
-
-func (u *serverUI) renderStatic() {
-	fmt.Fprint(os.Stderr, "press Ctrl-C to stop\n")
-}
-
-func (u *serverUI) Close() {
-	select {
-	case <-u.stop:
-	default:
-		close(u.stop)
-	}
-	<-u.done
+	_ = tui.RunDashboard(ctx, u.srv)
 }
 
 func osName() string {

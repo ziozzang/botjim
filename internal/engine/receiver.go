@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -54,6 +55,7 @@ type Receiver struct {
 	finalizeCh chan uint32
 	kick       chan struct{}
 	doneOnce   sync.Once
+	doneSent   atomic.Bool
 	ctrlDone   chan struct{}
 }
 
@@ -141,8 +143,9 @@ func (r *Receiver) Run(ctx context.Context) (Report, error) {
 	r.mu.Lock()
 	report := r.report
 	cancelled := report.Cancelled
+	completed := r.manifestDone && r.total > 0 && r.resolved >= r.total
 	r.mu.Unlock()
-	if wctx.Err() != nil && !cancelled && retErr == nil {
+	if wctx.Err() != nil && !cancelled && !completed && retErr == nil {
 		retErr = wctx.Err()
 	}
 	return report, retErr
@@ -161,6 +164,9 @@ func (r *Receiver) readCtrl(ctx context.Context, cancel context.CancelFunc) erro
 	for {
 		f, err := r.ctrl.Recv(buf)
 		if err != nil {
+			if r.doneSent.Load() {
+				return nil // peer hung up after our Done/Goodbye: clean end
+			}
 			return err
 		}
 		payload := f.Payload
@@ -696,6 +702,7 @@ func (r *Receiver) watchCompletion(ctx context.Context, cancel context.CancelFun
 			}
 			r.mu.Unlock()
 			r.doneOnce.Do(func() {
+				r.doneSent.Store(true)
 				_ = r.ctrl.Send(protocol.MsgDone, 0, done.Encode())
 				_ = r.ctrl.Send(protocol.MsgGoodbye, 0, nil)
 			})

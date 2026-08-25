@@ -56,10 +56,12 @@ func runBrowser(ctx context.Context, f *flags, addr string, alg uint8, resume ui
 		return 0
 	}
 	cfg, reg := buildClientConfig(f, addr, alg, resume, owners, sel)
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	ui := newClientUI(f, reg, f.pull)
-	ui.Run(ctx)
-	res := session.RunWithProgress(ctx, cfg, reg)
-	ui.Close()
+	res := ui.Run(rctx, cancel, func() session.ClientResult {
+		return session.RunWithProgress(rctx, cfg, reg)
+	})
 
 	rep := res.Report
 	fmt.Fprintf(os.Stderr, "%d files, %s transferred\n", rep.Files, humanBytes(rep.Bytes))

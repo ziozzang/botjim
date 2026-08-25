@@ -131,6 +131,9 @@ func (s *Server) handleConn(raw net.Conn) {
 		_ = raw.Close()
 		return
 	}
+	s.mu.Lock()
+	s.conns++
+	s.mu.Unlock()
 	defer func() {
 		_ = sess.Close()
 		s.mu.Lock()
@@ -412,11 +415,11 @@ func RunWithProgress(ctx context.Context, cfg ClientConfig, reg *progress.Regist
 		return ClientResult{Report: report, Err: err}
 	}
 
-	root, err := fsutil.ResolveRoot(cfg.DestRoot)
-	if err != nil {
+	if err := os.MkdirAll(cfg.DestRoot, 0o755); err != nil {
 		return ClientResult{Err: err}
 	}
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	root, err := fsutil.ResolveRoot(cfg.DestRoot)
+	if err != nil {
 		return ClientResult{Err: err}
 	}
 	recv := engine.NewReceiver(sess, ctrl, opts, reg, root)

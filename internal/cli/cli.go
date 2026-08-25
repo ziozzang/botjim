@@ -25,7 +25,6 @@ import (
 	"github.com/ziozzang/botjim/internal/attrs"
 	"github.com/ziozzang/botjim/internal/compress"
 	"github.com/ziozzang/botjim/internal/fsutil"
-	"github.com/ziozzang/botjim/internal/progress"
 	"github.com/ziozzang/botjim/internal/protocol"
 	"github.com/ziozzang/botjim/internal/session"
 	"github.com/ziozzang/botjim/internal/version"
@@ -275,17 +274,15 @@ func runServer(ctx context.Context, f *flags) error {
 	go func() { done <- srv.Serve(ln) }()
 
 	ui := newServerUI(srv, f)
-	go ui.Run(ctx)
+	ui.Run(ctx) // blocks: dashboard on TTY, ctx wait otherwise
 
+	srv.Stop()
+	time.Sleep(300 * time.Millisecond) // let sessions flush sidecars
 	select {
-	case <-ctx.Done():
-		srv.Stop()
-		time.Sleep(300 * time.Millisecond) // let sessions flush sidecars
-		ui.Close()
-		return nil
 	case err := <-done:
-		ui.Close()
 		return err
+	default:
+		return nil
 	}
 }
 
@@ -335,26 +332,13 @@ func runClient(ctx context.Context, f *flags) int {
 	if f.pull {
 		dir = protocol.DirPull
 	}
-	cfg := session.ClientConfig{
-		Addr:        addr,
-		Direction:   dir,
-		Paths:       paths,
-		DestRoot:    f.dest,
-		Compression: alg,
-		ZstdLevel:   compress.NormalizeZstdLevel(f.zstdLvl),
-		Parallel:    f.parallel,
-		Resume:      resume,
-		Preserve:    preserveBits(f),
-		Fsync:       !f.noFsync,
-		OwnerPolicy: owners,
-	}
-
-	reg := progress.New()
+	cfg, reg := buildClientConfig(f, addr, alg, resume, owners, paths)
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	ui := newClientUI(f, reg, dir == protocol.DirPull)
-	ui.Run(ctx)
-
-	res := session.RunWithProgress(ctx, cfg, reg)
-	ui.Close()
+	res := ui.Run(rctx, cancel, func() session.ClientResult {
+		return session.RunWithProgress(rctx, cfg, reg)
+	})
 
 	rep := res.Report
 	fmt.Fprintf(os.Stderr, "\n%d files, %s transferred", rep.Files, humanBytes(rep.Bytes))
