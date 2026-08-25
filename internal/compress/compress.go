@@ -49,8 +49,8 @@ func New(alg uint8, zstdLevel int) (Codec, error) {
 
 // zstdLevelToEncoder maps the CLI 1..4 scale onto encoder levels.
 var zstdLevelToEncoder = []zstd.EncoderLevel{
-	zstd.SpeedFastest,         // 1
-	zstd.SpeedDefault,         // 2
+	zstd.SpeedFastest,           // 1
+	zstd.SpeedDefault,           // 2
 	zstd.SpeedBetterCompression, // 3
 	zstd.SpeedBestCompression,   // 4
 }

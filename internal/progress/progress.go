@@ -15,12 +15,12 @@ import (
 
 // FileState is the per-file view the TUI renders.
 type FileState struct {
-	ID       uint32
-	Path     string
-	Size     int64
-	Done     int64 // verified bytes at destination (or sent bytes for sender view)
-	State    string
-	Err      string
+	ID    uint32
+	Path  string
+	Size  int64
+	Done  int64 // verified bytes at destination (or sent bytes for sender view)
+	State string
+	Err   string
 }
 
 // Snapshot is a consistent-ish view for one transfer.
@@ -60,9 +60,9 @@ type Registry struct {
 
 	start time.Time
 
-	mu     sync.RWMutex
-	files  map[uint32]*fileRow
-	order  []uint32
+	mu    sync.RWMutex
+	files map[uint32]*fileRow
+	order []uint32
 
 	// rate tracking
 	rateMu   sync.Mutex
@@ -72,11 +72,11 @@ type Registry struct {
 }
 
 type fileRow struct {
-	path string
-	size int64
-	done int64
+	path  string
+	size  int64
+	done  int64
 	state string
-	err  string
+	err   string
 }
 
 type ratePoint struct {
@@ -137,6 +137,9 @@ func (r *Registry) FileStateUpdate(id uint32, state, errMsg string) {
 // AddSent accumulates moved bytes.
 func (r *Registry) AddSent(n int64) { r.sentBytes.Add(uint64(n)) }
 
+// SentBytes returns bytes moved so far.
+func (r *Registry) SentBytes() uint64 { return r.sentBytes.Load() }
+
 // AddSkipped accumulates bytes not moved (already present).
 func (r *Registry) AddSkipped(n int64) { r.skippedBytes.Add(uint64(n)) }
 
@@ -153,15 +156,15 @@ func (r *Registry) Emit(kind, path, msg string) {
 func (r *Registry) Snapshot() Snapshot {
 	now := time.Now()
 	s := Snapshot{
-		Scanning:   r.scanning.Load(),
-		TotalFiles: r.totalFiles.Load(),
-		TotalBytes: r.totalBytes.Load(),
-		DoneFiles:  r.doneFiles.Load(),
-		ErrFiles:   r.errFiles.Load(),
-		SkipFiles:  r.skipFiles.Load(),
-		SentBytes:  r.sentBytes.Load(),
+		Scanning:     r.scanning.Load(),
+		TotalFiles:   r.totalFiles.Load(),
+		TotalBytes:   r.totalBytes.Load(),
+		DoneFiles:    r.doneFiles.Load(),
+		ErrFiles:     r.errFiles.Load(),
+		SkipFiles:    r.skipFiles.Load(),
+		SentBytes:    r.sentBytes.Load(),
 		SkippedBytes: r.skippedBytes.Load(),
-		Elapsed:    now.Sub(r.start),
+		Elapsed:      now.Sub(r.start),
 	}
 
 	r.mu.RLock()

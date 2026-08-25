@@ -39,8 +39,8 @@ func muxConfig() *yamux.Config {
 
 // Session wraps a yamux session.
 type Session struct {
-	ys  *yamux.Session
-	HS  *protocol.Handshake // peer's handshake (post-intersection features)
+	ys *yamux.Session
+	HS *protocol.Handshake // peer's handshake (post-intersection features)
 }
 
 // Dial connects, handshakes as client and multiplexes.

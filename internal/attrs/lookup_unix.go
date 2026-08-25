@@ -8,9 +8,9 @@ import (
 )
 
 var (
-	userMu    sync.Mutex
-	userCache = map[string]uint32{}
-	groupMu   sync.Mutex
+	userMu     sync.Mutex
+	userCache  = map[string]uint32{}
+	groupMu    sync.Mutex
 	groupCache = map[string]uint32{}
 )
 

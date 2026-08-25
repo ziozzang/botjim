@@ -298,10 +298,10 @@ func DecodeHaveBitmap(p []byte) (HaveBitmap, error) {
 
 // FileResult statuses.
 const (
-	ResultOK     uint8 = 0
-	ResultSkip   uint8 = 1
-	ResultError  uint8 = 2
-	ResultRetry  uint8 = 3 // unused, reserved
+	ResultOK    uint8 = 0
+	ResultSkip  uint8 = 1
+	ResultError uint8 = 2
+	ResultRetry uint8 = 3 // unused, reserved
 )
 
 // FileResult reports the outcome of one file.

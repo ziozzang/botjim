@@ -34,7 +34,7 @@ const ProtoMajor = 1
 // reserved hooks for an X25519 + ChaCha20-Poly1305 record layer that will
 // wrap the whole stream under yamux.
 const (
-	CipherPlain = 0
+	CipherPlain          = 0
 	CipherX25519ChaCha20 = 1 // reserved
 )
 
@@ -63,12 +63,12 @@ const (
 //	16 16  session nonce (random; also keys part-file name suffixes)
 //	32  4  crc32c over bytes 0..31
 type Handshake struct {
-	ProtoMajor uint8
-	ProtoMinor uint8
-	CipherID   uint8
-	Flags      uint8
+	ProtoMajor  uint8
+	ProtoMinor  uint8
+	CipherID    uint8
+	Flags       uint8
 	FeatureBits uint64
-	Nonce      [16]byte
+	Nonce       [16]byte
 }
 
 // NewHandshake builds a fresh handshake with a random nonce.
@@ -137,20 +137,20 @@ func ReadHandshake(r io.Reader) (*Handshake, error) {
 
 // Control message types.
 const (
-	MsgInitTransfer   uint8 = 0x01
-	MsgTransferAck    uint8 = 0x02
-	MsgManifestBatch  uint8 = 0x03
-	MsgManifestEnd    uint8 = 0x04
-	MsgHaveBitmap     uint8 = 0x10
-	MsgFileResult     uint8 = 0x11
-	MsgChunkRetry     uint8 = 0x12
-	MsgListReq        uint8 = 0x20
-	MsgListResp       uint8 = 0x21
-	MsgCancel         uint8 = 0x30
-	MsgAbort          uint8 = 0x31
-	MsgGoodbye        uint8 = 0x32
-	MsgError          uint8 = 0x33
-	MsgDone           uint8 = 0x34
+	MsgInitTransfer  uint8 = 0x01
+	MsgTransferAck   uint8 = 0x02
+	MsgManifestBatch uint8 = 0x03
+	MsgManifestEnd   uint8 = 0x04
+	MsgHaveBitmap    uint8 = 0x10
+	MsgFileResult    uint8 = 0x11
+	MsgChunkRetry    uint8 = 0x12
+	MsgListReq       uint8 = 0x20
+	MsgListResp      uint8 = 0x21
+	MsgCancel        uint8 = 0x30
+	MsgAbort         uint8 = 0x31
+	MsgGoodbye       uint8 = 0x32
+	MsgError         uint8 = 0x33
+	MsgDone          uint8 = 0x34
 )
 
 // CtrlFrameFlags — control payload compression.

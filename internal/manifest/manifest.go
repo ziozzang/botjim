@@ -121,8 +121,8 @@ type Skipped struct {
 // Walker walks roots and emits entries through emit. IDs are assigned at emit
 // time in traversal order; the receiver sees the same numbering.
 type Walker struct {
-	Opts     WalkOpts
-	OnSkip   func(Skipped)
+	Opts   WalkOpts
+	OnSkip func(Skipped)
 
 	uidNames map[string]string
 	gidNames map[string]string
