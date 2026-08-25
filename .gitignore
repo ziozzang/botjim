@@ -3,3 +3,4 @@ go build: artifacts ignore
 /dist/
 *.test
 *.out
+*.pid
