@@ -43,9 +43,11 @@ func NewDataStream(rw io.ReadWriter, index uint64) (*DataStream, error) {
 	return &DataStream{conn: rw, br: bufio.NewReaderSize(rw, 256<<10)}, nil
 }
 
-// AcceptDataStream validates the hello on an accepted stream.
+// AcceptDataStream validates the hello on an accepted stream. The buffered
+// reader created here is the one the stream keeps: re-reading with a fresh
+// reader would lose any frames the first one buffered.
 func AcceptDataStream(rw io.ReadWriter) (*DataStream, uint64, error) {
-	br := bufio.NewReaderSize(rw, 64)
+	br := bufio.NewReaderSize(rw, 256<<10)
 	kind, err := br.ReadByte()
 	if err != nil {
 		return nil, 0, err
@@ -57,7 +59,7 @@ func AcceptDataStream(rw io.ReadWriter) (*DataStream, uint64, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	return &DataStream{conn: rw, br: bufio.NewReaderSize(rw, 256<<10)}, index, nil
+	return &DataStream{conn: rw, br: br}, index, nil
 }
 
 // ChunkHeader describes one chunk frame.

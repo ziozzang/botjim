@@ -12,9 +12,9 @@ import (
 	"github.com/ziozzang/botjim/internal/protocol"
 )
 
-// startTestServer runs a server on an ephemeral port and returns its address
-// and a stop function.
-func startTestServer(t *testing.T, root string, push, pull bool) (string, func()) {
+// startTestServer runs a server on an ephemeral port and returns its
+// address, the server (for idle polling) and a stop function.
+func startTestServer(t *testing.T, root string, push, pull bool) (string, *Server, func()) {
 	t.Helper()
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
@@ -32,13 +32,25 @@ func startTestServer(t *testing.T, root string, push, pull bool) (string, func()
 	})
 	done := make(chan struct{})
 	go func() { _ = srv.Serve(ln); close(done) }()
-	return ln.Addr().String(), func() {
+	return ln.Addr().String(), srv, func() {
 		srv.Stop()
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):
 		}
 	}
+}
+
+// waitIdle blocks until the server has no active transfer sessions.
+func waitIdle(t *testing.T, srv *Server) {
+	t.Helper()
+	for i := 0; i < 200; i++ {
+		if len(srv.Regs()) == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("server never went idle")
 }
 
 func TestPushBasic(t *testing.T) {
@@ -55,7 +67,7 @@ func TestPushBasic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	addr, stop := startTestServer(t, dst, true, true)
+	addr, _, stop := startTestServer(t, dst, true, true)
 	defer stop()
 
 	res := RunTransfer(context.Background(), ClientConfig{

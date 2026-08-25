@@ -131,7 +131,9 @@ func (c *lz4Codec) Compress(dst, src []byte) ([]byte, bool) {
 		dst = make([]byte, bound)
 	}
 	n, err := lz4.CompressBlock(src, dst[:bound], nil)
-	if err != nil || n == 0 { // 0 = incompressible
+	// 0 = incompressible; the block API may also return output larger than
+	// the input for high-entropy data — both fall back to raw.
+	if err != nil || n == 0 || n >= len(src) {
 		return src, true
 	}
 	return dst[:n], false

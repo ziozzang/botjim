@@ -125,8 +125,11 @@ func (r *Receiver) Run(ctx context.Context) (Report, error) {
 	// data accept loop (this goroutine)
 	accErr := r.acceptLoop(wctx)
 
-	// sidecar flush on the way out
+	// sidecar flush on the way out, then release every remaining part lock
+	// (part fds must not wait for GC — the flock guards cross-session
+	// adoption and a later run must be able to take over)
 	r.flushAllSidecars()
+	r.closeAllParts()
 
 	cancel()
 	close(r.rehashCh)
@@ -244,8 +247,20 @@ func (r *Receiver) processEntry(ctx context.Context, e manifest.Entry) {
 		r.failEntry(e, CodeInvalidPath, err.Error())
 		return
 	}
-	if prev, dup := r.caseSeen[strings.ToLower(e.RelPath)]; dup && prev != e.RelPath {
-		r.failEntry(e, CodeInvalidPath, fmt.Sprintf("case collision with %q (case-insensitive target?)", prev))
+	if prev, dup := r.caseSeen[strings.ToLower(e.RelPath)]; dup {
+		if prev != e.RelPath {
+			r.failEntry(e, CodeInvalidPath, fmt.Sprintf("case collision with %q (case-insensitive target?)", prev))
+			return
+		}
+		// exact duplicate (overlapping roots like "file dir/"): the first
+		// entry owns the destination; this one is skipped without data.
+		r.sendHave(e.ID, protocol.HaveAllSkip, nil)
+		r.reg.FileStateUpdate(e.ID, "skipped", "")
+		r.mu.Lock()
+		r.resolved++
+		r.mu.Unlock()
+		_ = r.ctrl.Send(protocol.MsgFileResult, 0, protocol.FileResult{FileID: e.ID, Status: protocol.ResultSkip}.Encode())
+		r.kickCompletion()
 		return
 	}
 	r.mu.Lock()
@@ -316,6 +331,7 @@ func (r *Receiver) prepareRegular(ctx context.Context, e manifest.Entry) {
 			r.reg.AddSkipped(e.Size)
 			r.reg.FileStateUpdate(e.ID, "skipped", "")
 			r.okEntry(e, "")
+			r.pruneStaleParts(abs)
 			return
 		}
 	}
@@ -362,24 +378,33 @@ func (r *Receiver) prepareRegular(ctx context.Context, e manifest.Entry) {
 	f.partPath = part
 	f.sc = sc
 
-	// open (or create) the part file
-	pf, err := os.OpenFile(part, os.O_RDWR|os.O_CREATE, 0o600)
+	// open (or create) the part file and take an exclusive non-blocking
+	// lock: a part owned by a still-live session must not be adopted (it
+	// would be renamed out from under us); we start our own instead.
+	pf, err := openPartLocked(part, e.Size)
+	if err == errPartLocked && partExisted {
+		// fall back to a private part under this session's nonce
+		part = sidecar.PartPath(abs, r.nonce)
+		f.partPath = part
+		sc = sidecar.New(e, r.nonce)
+		f.sc = sc
+		partExisted = false
+		pf, err = openPartLocked(part, e.Size)
+	}
 	if err != nil {
 		r.failEntry(e, CodeIO, "part: "+err.Error())
-		return
-	}
-	if err := pf.Truncate(e.Size); err != nil {
-		_ = pf.Close()
-		r.failEntry(e, CodeIO, "truncate: "+err.Error())
 		return
 	}
 	f.part = pf
 
 	// verify have-bits by re-hashing the part (bitmap is a hint; data rules).
-	// a part without a usable sidecar is fully rehashed to rebuild it.
+	// a part without a usable sidecar is fully rehashed to rebuild it — with
+	// one carve-out: zero chunks cannot be trusted there, because an
+	// unwritten hole is indistinguishable from a real zero chunk. They are
+	// re-requested instead (the sender re-sends real holes as zero-flags).
 	resumed := int64(0)
 	if !sc.FullyWritten && (sc.HaveCount() > 0 || (partExisted && !scHadSidecar)) {
-		resumed = r.rehashPart(f, e, grid)
+		resumed = r.rehashPart(f, e, grid, partExisted && !scHadSidecar)
 	}
 	r.sendHave(e.ID, protocol.HavePartial, sc.Bitmap())
 
@@ -392,21 +417,24 @@ func (r *Receiver) prepareRegular(ctx context.Context, e manifest.Entry) {
 	}
 	r.reg.FileStateUpdate(e.ID, "active", "")
 
-	// fully-resumed or FullyWritten sidecar: straight to finalize
-	if sc.Complete() {
+	// fully-resumed or FullyWritten sidecar: straight to finalize (chunks
+	// may already be arriving: take the per-file lock for the check)
+	f.mu.Lock()
+	complete := sc.Complete()
+	f.mu.Unlock()
+	if complete {
 		r.queueFinalize(e.ID)
 	}
 }
 
-// rehashPart re-verifies every have-marked chunk of a resumed part. When the
-// sidecar was rebuilt from scratch this rehashes the whole file to discover
-// what is actually there (the deterministic grid makes this possible). It
-// returns the byte total of chunks kept.
-func (r *Receiver) rehashPart(f *rxFile, e manifest.Entry, grid chunking.Grid) int64 {
+// rehashPart re-verifies every have-marked chunk of a resumed part. When
+// rebuilt is true the sidecar was lost and every chunk is claimed and
+// re-adopted from the file itself — except zero chunks, which are
+// unverifiable without the original hash and are dropped instead.
+func (r *Receiver) rehashPart(f *rxFile, e manifest.Entry, grid chunking.Grid, rebuilt bool) int64 {
 	keptBytes := int64(0)
 	total := grid.Count()
-	// sidecar-less rebuild: claim every chunk, adopt what hashes cleanly
-	if f.sc.HaveCount() == 0 {
+	if rebuilt {
 		have := make([]byte, (total+7)/8)
 		for i := int64(0); i < total; i++ {
 			have[i/8] |= 1 << (uint(i) % 8)
@@ -436,15 +464,21 @@ func (r *Receiver) rehashPart(f *rxFile, e manifest.Entry, grid chunking.Grid) i
 			continue
 		}
 		if chunking.AllZero(chunk) {
-			f.sc.SetHave(i, chunking.ZeroHash, true)
+			if rebuilt {
+				f.sc.ClearHave(i) // unverifiable hole: re-request
+				continue
+			}
+			if f.sc.Hashes[i] != "Z" {
+				f.sc.ClearHave(i)
+				continue
+			}
 			keptBytes += n
 			continue
 		}
 		h := chunking.ChunkSHA(e.RelPath, i, chunk)
 		want := f.sc.Hashes[i]
 		if want == "" {
-			// rebuilt sidecar: adopt the on-disk data as-is
-			f.sc.SetHave(i, h, false)
+			f.sc.SetHave(i, h, false) // rebuilt: adopt verified-by-presence data
 			keptBytes += n
 			continue
 		}
@@ -643,22 +677,58 @@ func (r *Receiver) finalize(id uint32) {
 		return
 	}
 	f.part = nil
+	// record completion (sidecar first: a crash between these steps is
+	// repaired by the next run's all-skip + prune), then swap into place
+	// and drop the sidecar and any stale siblings
+	f.mu.Lock()
+	f.sc.FullyWritten = true
+	serr := f.sc.SaveAtomic(f.partPath)
+	f.mu.Unlock()
+	if serr != nil {
+		r.failFile(f, CodeIO, "sidecar: "+serr.Error())
+		return
+	}
 	if err := os.Rename(f.partPath, f.abs); err != nil {
 		r.failFile(f, CodeIO, "rename: "+err.Error())
 		return
 	}
-	// record completion, then drop the sidecar and any stale siblings
-	f.sc.FullyWritten = true
-	_ = f.sc.SaveAtomic(f.partPath)
 	_ = os.Remove(sidecar.MetaPathForPart(f.partPath))
 	_, _, stale := sidecar.Discover(f.abs)
 	for _, s := range stale {
 		_ = os.Remove(s)
 		_ = os.Remove(sidecar.MetaPathForPart(s))
 	}
+	f.mu.Lock()
 	f.dirty = false
+	f.mu.Unlock()
 	r.reg.FileStateUpdate(e.ID, "done", "")
 	r.okEntryLocked(f, e)
+	r.pruneStaleParts(f.abs)
+}
+
+// pruneStaleParts removes leftover parts (and their sidecars) for an
+// already-final path — abandoned by interrupted earlier sessions. Parts
+// still locked by a live session are left alone.
+func (r *Receiver) pruneStaleParts(abs string) {
+	_, _, stale := sidecar.Discover(abs)
+	for _, s := range stale {
+		removeIfUnlocked(s)
+	}
+}
+
+func removeIfUnlocked(part string) {
+	pf, err := os.OpenFile(part, os.O_RDWR, 0o600)
+	if err != nil {
+		_ = os.Remove(part) // gone or unreadable: nothing to protect
+		_ = os.Remove(sidecar.MetaPathForPart(part))
+		return
+	}
+	defer pf.Close()
+	if err := unix.Flock(int(pf.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		return // owned by a live session
+	}
+	_ = os.Remove(part)
+	_ = os.Remove(sidecar.MetaPathForPart(part))
 }
 
 // watchCompletion triggers the post-pass and the Done/Goodbye handshake.
@@ -693,7 +763,7 @@ func (r *Receiver) watchCompletion(ctx context.Context, cancel context.CancelFun
 		if manifestDone && !postRan && resolved+hl >= total {
 			r.maybePostPass(false)
 		}
-		if manifestDone && r.resolved >= total && r.postRan {
+		if manifestDone && resolved >= total && postRan {
 			r.mu.Lock()
 			done := protocol.Done{
 				Files:  r.report.Files,
@@ -938,6 +1008,25 @@ func (r *Receiver) flushAllSidecars() {
 	}
 }
 
+// closeAllParts closes part fds still held by unfinished files so their
+// flocks drop deterministically at session end.
+func (r *Receiver) closeAllParts() {
+	r.mu.Lock()
+	fs := make([]*rxFile, 0, len(r.files))
+	for _, f := range r.files {
+		fs = append(fs, f)
+	}
+	r.mu.Unlock()
+	for _, f := range fs {
+		f.mu.Lock()
+		if f.part != nil {
+			_ = f.part.Close()
+			f.part = nil
+		}
+		f.mu.Unlock()
+	}
+}
+
 // abortParts deletes partials for an aborted transfer.
 func (r *Receiver) abortParts() {
 	r.mu.Lock()
@@ -1005,6 +1094,30 @@ func nonceOf(partPath string) string {
 		return base[i+len(sidecar.PartPrefix):]
 	}
 	return "0000"
+}
+
+// errPartLocked marks a part held by another live session.
+var errPartLocked = errors.New("part owned by another session")
+
+// openPartLocked opens (creating if needed) a part file sized to size and
+// holds an exclusive non-blocking flock on it for the session's lifetime.
+func openPartLocked(part string, size int64) (*os.File, error) {
+	pf, err := os.OpenFile(part, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Flock(int(pf.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		_ = pf.Close()
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return nil, errPartLocked
+		}
+		return nil, err
+	}
+	if err := pf.Truncate(size); err != nil {
+		_ = pf.Close()
+		return nil, err
+	}
+	return pf, nil
 }
 
 func hexHash(h [32]byte) string {

@@ -377,7 +377,9 @@ func (s *Sender) gateOpen(m protocol.HaveBitmap) {
 		s.report.SkippedBytes += uint64(f.entry.Size)
 		s.reg.AddSkipped(f.entry.Size)
 	case protocol.HavePartial:
-		f.have = m.Bitmap
+		// the decoded payload aliases the control reader's reusable buffer:
+		// copy the bitmap before the next frame overwrites it
+		f.have = append([]byte(nil), m.Bitmap...)
 	case protocol.HaveNone:
 		f.have = []byte{}
 	}

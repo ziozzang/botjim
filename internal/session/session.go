@@ -362,6 +362,18 @@ func RunWithProgress(ctx context.Context, cfg ClientConfig, reg *progress.Regist
 	if err != nil {
 		return ClientResult{Err: err}
 	}
+	finished := make(chan struct{})
+	defer close(finished)
+	// A cancelled caller context must tear the connection down: engine
+	// control readers block on the peer, and only closing the session
+	// unwinds them. The receiver flushes its sidecars on disconnect.
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = sess.Close()
+		case <-finished:
+		}
+	}()
 	defer sess.Close()
 
 	ctrlConn, err := openControl(sess)

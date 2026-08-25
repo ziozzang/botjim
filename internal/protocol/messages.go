@@ -205,7 +205,9 @@ func DecodeEntry(p []byte) (manifest.Entry, int, error) {
 	}
 	for i := uint64(0); i < nx; i++ {
 		name := d.str()
-		val := d.bytes()
+		// copy: the payload may alias the control reader's reusable buffer,
+		// and xattr values outlive the frame (applied at finalize time)
+		val := append([]byte(nil), d.bytes()...)
 		e.Xattrs = append(e.Xattrs, manifest.Xattr{Name: name, Value: val})
 	}
 	if d.err != nil {
