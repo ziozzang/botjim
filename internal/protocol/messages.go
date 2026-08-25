@@ -30,7 +30,8 @@ const (
 	PreserveOwners   uint16 = 1 << 5
 )
 
-// InitTransfer opens a transfer on a session.
+// InitTransfer opens a transfer on a session. Paths carries the pull-side
+// roots (server-relative) when Dir is pull.
 type InitTransfer struct {
 	Dir         uint8
 	Compression uint8
@@ -40,6 +41,7 @@ type InitTransfer struct {
 	Parallel    uint8
 	Resume      uint8 // 0 = on (strict), 1 = size-only, 2 = fresh
 	RootName    string
+	Paths       []string
 }
 
 // Encode serializes m.
@@ -53,12 +55,17 @@ func (m InitTransfer) Encode() []byte {
 	e.u8(m.Parallel)
 	e.u8(m.Resume)
 	e.str(m.RootName)
+	e.uv(uint64(len(m.Paths)))
+	for _, p := range m.Paths {
+		e.str(p)
+	}
 	return e.b
 }
 
 // DecodeInitTransfer parses an InitTransfer payload.
 func DecodeInitTransfer(p []byte) (InitTransfer, error) {
 	var d dec
+	d.b = p
 	var m InitTransfer
 	m.Dir = d.u8()
 	m.Compression = d.u8()
@@ -68,6 +75,13 @@ func DecodeInitTransfer(p []byte) (InitTransfer, error) {
 	m.Parallel = d.u8()
 	m.Resume = d.u8()
 	m.RootName = d.str()
+	n := d.uv()
+	if n > 4096 {
+		return m, fmt.Errorf("too many pull paths: %d", n)
+	}
+	for i := uint64(0); i < n; i++ {
+		m.Paths = append(m.Paths, d.str())
+	}
 	if d.err != nil {
 		return m, d.err
 	}
@@ -100,6 +114,7 @@ func (m TransferAck) Encode() []byte {
 // DecodeTransferAck parses a TransferAck payload.
 func DecodeTransferAck(p []byte) (TransferAck, error) {
 	var d dec
+	d.b = p
 	var m TransferAck
 	m.OK = d.u8() == 1
 	m.ErrCode = d.u16()
@@ -255,6 +270,7 @@ func (m ManifestEnd) Encode() []byte {
 // DecodeManifestEnd parses a ManifestEnd payload.
 func DecodeManifestEnd(p []byte) (ManifestEnd, error) {
 	var d dec
+	d.b = p
 	var m ManifestEnd
 	m.Files = d.u64()
 	m.Bytes = d.u64()
@@ -289,6 +305,7 @@ func (m HaveBitmap) Encode() []byte {
 // DecodeHaveBitmap parses a HaveBitmap payload.
 func DecodeHaveBitmap(p []byte) (HaveBitmap, error) {
 	var d dec
+	d.b = p
 	var m HaveBitmap
 	m.FileID = uint32(d.uv())
 	m.Status = d.u8()
@@ -325,6 +342,7 @@ func (m FileResult) Encode() []byte {
 // DecodeFileResult parses a FileResult payload.
 func DecodeFileResult(p []byte) (FileResult, error) {
 	var d dec
+	d.b = p
 	var m FileResult
 	m.FileID = uint32(d.uv())
 	m.Status = d.u8()
@@ -353,6 +371,7 @@ func (m ChunkRetry) Encode() []byte {
 // DecodeChunkRetry parses a ChunkRetry payload.
 func DecodeChunkRetry(p []byte) (ChunkRetry, error) {
 	var d dec
+	d.b = p
 	var m ChunkRetry
 	m.FileID = uint32(d.uv())
 	m.ChunkIdx = d.uv()
@@ -388,6 +407,7 @@ func (m ListReq) Encode() []byte {
 // DecodeListReq parses a ListReq payload.
 func DecodeListReq(p []byte) (ListReq, error) {
 	var d dec
+	d.b = p
 	var m ListReq
 	m.Path = d.str()
 	m.Offset = d.u32()
@@ -429,6 +449,7 @@ func (m ListResp) Encode() []byte {
 // DecodeListResp parses a ListResp payload.
 func DecodeListResp(p []byte) (ListResp, error) {
 	var d dec
+	d.b = p
 	var m ListResp
 	m.Total = d.u32()
 	m.Truncated = d.u8() == 1
@@ -474,6 +495,7 @@ func (m ErrMsg) Encode() []byte {
 // DecodeErrMsg parses an ErrMsg payload.
 func DecodeErrMsg(p []byte) (ErrMsg, error) {
 	var d dec
+	d.b = p
 	var m ErrMsg
 	m.Scope = d.u8()
 	m.Code = d.u16()
@@ -500,6 +522,7 @@ func (m Done) Encode() []byte {
 // DecodeDone parses a Done payload.
 func DecodeDone(p []byte) (Done, error) {
 	var d dec
+	d.b = p
 	var m Done
 	m.Files = d.u64()
 	m.Bytes = d.u64()

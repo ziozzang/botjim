@@ -41,11 +41,27 @@ func isEPERMish(err error) bool {
 	return errors.Is(err, os.ErrPermission) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES)
 }
 
-func goMode(m uint32) os.FileMode { return os.FileMode(m & 0o7777) }
+// goMode converts raw POSIX mode bits (S_ISUID/S_ISGID/S_ISVTX included)
+// into an os.FileMode the Chmod family interprets correctly.
+func goMode(m uint32) os.FileMode {
+	fm := os.FileMode(m & 0o777)
+	if m&0o4000 != 0 {
+		fm |= os.ModeSetuid
+	}
+	if m&0o2000 != 0 {
+		fm |= os.ModeSetgid
+	}
+	if m&0o1000 != 0 {
+		fm |= os.ModeSticky
+	}
+	return fm
+}
 
-// ApplyFile applies entry metadata through an open fd (order: chown, chmod,
-// xattr, utimes). Returns warnings; a warning never fails the file.
-func ApplyFile(fd *os.File, e manifest.Entry, policy OwnerPolicy) []Warning {
+// ApplyFile applies entry metadata through an open fd and its on-disk path
+// (order: chown, chmod, xattr, utimes). The path is used for nanosecond-
+// precision utimensat; the fd keeps chown/chmod/xattr race-free. Returns
+// warnings; a warning never fails the file.
+func ApplyFile(fd *os.File, path string, e manifest.Entry, policy OwnerPolicy) []Warning {
 	var ws []Warning
 	if policy != OwnerNone {
 		uid, gid, ok := resolveOwner(e, policy)
@@ -61,7 +77,7 @@ func ApplyFile(fd *os.File, e manifest.Entry, policy OwnerPolicy) []Warning {
 		ws = append(ws, Warning{Path: e.RelPath, Op: "chmod", Err: err})
 	}
 	ws = append(ws, applyXattrsFD(fd, e)...)
-	if err := futimens(fd, e.Mtime, e.Atime); err != nil {
+	if err := utimensatFollow(path, e.Mtime, e.Atime); err != nil {
 		ws = append(ws, Warning{Path: e.RelPath, Op: "utimes", Err: err})
 	}
 	return ws
@@ -167,20 +183,20 @@ func resolveOwner(e manifest.Entry, policy OwnerPolicy) (uid, gid uint32, ok boo
 	return 0, 0, false
 }
 
-func futimens(fd *os.File, mtime, atime manifest.Timespec) error {
-	tv := []unix.Timeval{
-		{Sec: atime.Sec, Usec: int64(atime.Nsec / 1000)},
-		{Sec: mtime.Sec, Usec: int64(mtime.Nsec / 1000)},
+func utimensatFollow(path string, mtime, atime manifest.Timespec) error {
+	ts := []unix.Timespec{
+		{Sec: atime.Sec, Nsec: int64(atime.Nsec)},
+		{Sec: mtime.Sec, Nsec: int64(mtime.Nsec)},
 	}
-	return unix.Futimes(int(fd.Fd()), tv)
+	return unix.UtimesNanoAt(unix.AT_FDCWD, path, ts, 0)
 }
 
 func utimensat(path string, mtime, atime manifest.Timespec) error {
-	tv := []unix.Timeval{
-		{Sec: atime.Sec, Usec: int64(atime.Nsec / 1000)},
-		{Sec: mtime.Sec, Usec: int64(mtime.Nsec / 1000)},
+	ts := []unix.Timespec{
+		{Sec: atime.Sec, Nsec: int64(atime.Nsec)},
+		{Sec: mtime.Sec, Nsec: int64(mtime.Nsec)},
 	}
-	return unix.Lutimes(path, tv)
+	return unix.UtimesNanoAt(unix.AT_FDCWD, path, ts, unix.AT_SYMLINK_NOFOLLOW)
 }
 
 func applyXattrsFD(fd *os.File, e manifest.Entry) []Warning {

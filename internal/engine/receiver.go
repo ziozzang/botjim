@@ -335,6 +335,7 @@ func (r *Receiver) prepareRegular(ctx context.Context, e manifest.Entry) {
 	}
 	var sc *sidecar.Sidecar
 	scHadSidecar := false
+	partExisted := part != ""
 	if part != "" {
 		if meta != "" {
 			if loaded, err := sidecar.Load(meta); err == nil {
@@ -369,9 +370,9 @@ func (r *Receiver) prepareRegular(ctx context.Context, e manifest.Entry) {
 	f.part = pf
 
 	// verify have-bits by re-hashing the part (bitmap is a hint; data rules).
-	// a sidecar-less part is fully rehashed to rebuild the bitmap.
+	// a part without a usable sidecar is fully rehashed to rebuild it.
 	resumed := int64(0)
-	if !sc.FullyWritten && (sc.HaveCount() > 0 || (part != "" && !scHadSidecar)) {
+	if !sc.FullyWritten && (sc.HaveCount() > 0 || (partExisted && !scHadSidecar)) {
 		resumed = r.rehashPart(f, e, grid)
 	}
 	r.sendHave(e.ID, protocol.HavePartial, sc.Bitmap())
@@ -461,7 +462,7 @@ func (r *Receiver) writeEmpty(abs string, e manifest.Entry) {
 		return
 	}
 	defer fd.Close()
-	for _, w := range attrs.ApplyFile(fd, e, r.opts.OwnerPolicy) {
+	for _, w := range attrs.ApplyFile(fd, abs, e, r.opts.OwnerPolicy) {
 		r.warn(w.String())
 	}
 	r.reg.FileStateUpdate(e.ID, "done", "")
@@ -628,7 +629,7 @@ func (r *Receiver) finalize(id uint32) {
 			return
 		}
 	}
-	for _, w := range attrs.ApplyFile(f.part, e, r.opts.OwnerPolicy) {
+	for _, w := range attrs.ApplyFile(f.part, f.partPath, e, r.opts.OwnerPolicy) {
 		r.warn(w.String())
 	}
 	if err := f.part.Close(); err != nil {

@@ -185,17 +185,21 @@ func (s *Sender) Run(ctx context.Context) (Report, error) {
 		}
 	}
 
+	s.mu.Lock()
+	s.report.Bytes = s.reg.SentBytes()
+	cancelled := s.report.Cancelled
+	completed := s.resolved >= files && files > 0
+	s.mu.Unlock()
 	if perr := s.remoteErr.Load(); perr != nil {
 		return s.report, *perr
 	}
 	if walkErr != nil && !isCtxErr(walkErr) {
 		return s.report, walkErr
 	}
-	s.mu.Lock()
-	cancelled := s.report.Cancelled
-	s.mu.Unlock()
-	if wctx.Err() != nil && !cancelled {
+	if wctx.Err() != nil && !cancelled && !completed {
+		s.mu.Lock()
 		s.report.Cancelled = true
+		s.mu.Unlock()
 	}
 	return s.report, nil
 }
@@ -411,8 +415,11 @@ func (s *Sender) fileResult(m protocol.FileResult) {
 			s.resolved++
 		}
 	} else {
-		// non-data entry (dir/symlink/node): count its echo directly
+		// non-data entry (dir/symlink/node/hardlink): count its echo directly
 		s.resolved++
+		if m.Status != protocol.ResultError {
+			s.report.Files++
+		}
 		s.reg.FileStateUpdate(m.FileID, "done", "")
 	}
 	s.mu.Unlock()
