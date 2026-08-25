@@ -6,7 +6,8 @@ package tui
 
 // BrowserConfig configures the picker.
 type BrowserConfig struct {
-	Addr string
-	Pull bool // browse the remote (true) or the local cwd (false)
-	Dest string
+	Addr     string
+	Pull     bool // browse the remote (true) or the local cwd (false)
+	Dest     string
+	StartDir string // push: directory to open first (sticky across sends)
 }

@@ -26,7 +26,11 @@ var (
 	cWarn     = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 	cPathSt   = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 	cFileRate = lipgloss.NewStyle().Foreground(lipgloss.Color("114"))
+	cLogBox   = lipgloss.NewStyle().Border(lipgloss.NormalBorder(), false, false, false, true).
+			BorderForeground(lipgloss.Color("238"))
 )
+
+const logHistoryCap = 1000
 
 // perFileTrack remembers the previous snapshot's per-file progress so the
 // view can show a live per-file speed and remaining time.
@@ -36,18 +40,23 @@ type perFileTrack struct {
 }
 
 // clientModel is the push/pull progress view: aggregate bar, live rate,
-// ETA, per-file speed and remaining time, plus a rolling transfer log.
+// ETA, per-file speed and remaining time, and a scrolling transfer log.
 type clientModel struct {
 	reg     *progress.Registry
 	pull    bool
 	bar     bprogress.Model
 	snap    progress.Snapshot
-	events  []string
+	events  []string // full log history (capped)
+	logOff  int      // scroll offset into events; tail when follow
+	follow  bool     // stick to the tail of the log
 	done    bool
 	err     error
+	waitKey bool // after completion, wait for a key (browser flow)
+	help    bool // '?' overlay
 	track   perFileTrack
-	rates   map[uint32]float64 // per-file bytes/s from the last interval
-	logRows int
+	rates   map[uint32]float64
+	width   int
+	height  int
 }
 
 type tickMsg time.Time
@@ -59,14 +68,17 @@ func clientTick() tea.Cmd {
 }
 
 // RunClientProgress runs the full-screen client progress UI until the
-// transfer context finishes. Returns when the UI exits.
-func RunClientProgress(ctx context.Context, reg *progress.Registry, pull bool, done <-chan error) error {
+// transfer finishes; with waitKey it then waits for one more keypress
+// (the browser flow returns to the picker afterwards).
+func RunClientProgress(ctx context.Context, reg *progress.Registry, pull bool, done <-chan error, waitKey bool) error {
 	bar := bprogress.New(bprogress.WithScaledGradient("#3fb950", "#58a6ff"))
 	m := &clientModel{
 		reg: reg, pull: pull, bar: bar,
 		track:   perFileTrack{at: time.Now(), done: map[uint32]int64{}},
 		rates:   map[uint32]float64{},
-		logRows: 8,
+		follow:  true,
+		waitKey: waitKey,
+		width:   80, height: 24,
 	}
 	p := tea.NewProgram(m, tea.WithOutput(os.Stderr), tea.WithAltScreen())
 
@@ -86,21 +98,7 @@ func RunClientProgress(ctx context.Context, reg *progress.Registry, pull bool, d
 				p.Send(msg)
 				return
 			case e := <-reg.Events:
-				line := time.Now().Format("15:04:05 ")
-				var styled string
-				switch e.Kind {
-				case "file-done":
-					styled = cOk.Render("✔") + " " + cPathSt.Render(e.Path)
-				case "file-skip":
-					styled = cDim.Render("⤼") + " " + cPathSt.Render(e.Path) + cDim.Render("  "+e.Msg)
-				case "file-error":
-					styled = cErr.Render("✖") + " " + cPathSt.Render(e.Path) + " " + cErr.Render(e.Msg)
-				case "warn":
-					styled = cWarn.Render("!") + " " + cWarn.Render(e.Path+" "+e.Msg)
-				default:
-					styled = cDim.Render("·") + " " + cDim.Render(e.Path+" "+e.Msg)
-				}
-				p.Send(eventMsg(line + styled))
+				p.Send(eventMsg(formatEvent(e)))
 			case <-ctx.Done():
 				return
 			}
@@ -110,12 +108,32 @@ func RunClientProgress(ctx context.Context, reg *progress.Registry, pull bool, d
 	return err
 }
 
+func formatEvent(e progress.Event) string {
+	line := e.At.Format("15:04:05 ")
+	switch e.Kind {
+	case "file-done":
+		line += cOk.Render("✔") + " " + cPathSt.Render(e.Path)
+	case "file-skip":
+		line += cDim.Render("⤼") + " " + cPathSt.Render(e.Path) + cDim.Render("  "+e.Msg)
+	case "file-error":
+		line += cErr.Render("✖") + " " + cPathSt.Render(e.Path) + " " + cErr.Render(e.Msg)
+	case "warn":
+		line += cWarn.Render("!") + " " + cWarn.Render(e.Path+" "+e.Msg)
+	default:
+		line += cDim.Render("·") + " " + cDim.Render(e.Path+" "+e.Msg)
+	}
+	return line
+}
+
 type eventMsg string
 
 func (m *clientModel) Init() tea.Cmd { return clientTick() }
 
 func (m *clientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
+		return m, nil
 	case tickMsg:
 		m.refresh()
 		if !m.done {
@@ -124,26 +142,75 @@ func (m *clientModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case eventMsg:
 		m.events = append(m.events, string(msg))
-		if len(m.events) > m.logRows {
-			m.events = m.events[len(m.events)-m.logRows:]
+		if len(m.events) > logHistoryCap {
+			m.events = m.events[len(m.events)-logHistoryCap:]
 		}
 		return m, nil
 	case doneMsg:
 		m.done = true
 		m.err = msg.err
 		m.refresh()
+		if m.waitKey {
+			return m, nil // show the final frame until a key
+		}
 		return m, tea.Quit
 	case tea.KeyMsg:
+		if m.help {
+			m.help = false
+			return m, nil
+		}
 		if msg.Type == tea.KeyCtrlC {
 			return m, tea.Quit
 		}
-	case tea.WindowSizeMsg:
-		// adjust the log depth to the terminal
-		if rows := msg.Height / 3; rows > 3 && rows < 12 {
-			m.logRows = rows
+		if msg.String() == "?" {
+			m.help = true
+			return m, nil
+		}
+		if m.done && m.waitKey {
+			return m, tea.Quit
+		}
+		// log scrolling
+		rows := m.logRows()
+		switch msg.Type {
+		case tea.KeyUp:
+			m.scrollLog(-1)
+		case tea.KeyDown:
+			m.scrollLog(1)
+		case tea.KeyPgUp:
+			m.scrollLog(-rows)
+		case tea.KeyPgDown:
+			m.scrollLog(rows)
+		case tea.KeyEnd:
+			m.follow = true
+		case tea.KeyHome:
+			m.logOff = 0
+			m.follow = false
 		}
 	}
 	return m, nil
+}
+
+func (m *clientModel) scrollLog(delta int) {
+	m.follow = false
+	m.logOff += delta
+	if m.logOff < 0 {
+		m.logOff = 0
+	}
+	if max := len(m.events) - m.logRows(); max >= 0 && m.logOff > max {
+		m.logOff = max
+	}
+	if m.logOff >= len(m.events)-m.logRows() {
+		m.follow = true
+	}
+}
+
+// logRows is how many log lines fit under the header, bar and file table.
+func (m *clientModel) logRows() int {
+	n := m.height - 12 // header(2)+bar(2)+stats(2)+files(4)+title(1)+footer(1)
+	if n < 3 {
+		n = 3
+	}
+	return n
 }
 
 // refresh snapshots progress and derives per-file speeds from the delta
@@ -170,6 +237,9 @@ func (m *clientModel) refresh() {
 }
 
 func (m *clientModel) View() string {
+	if m.help {
+		return m.helpView()
+	}
 	var b strings.Builder
 	s := m.snap
 	direction := cDir.Render("push ↑")
@@ -182,30 +252,28 @@ func (m *clientModel) View() string {
 	if s.Scanning {
 		title += cDim.Render(fmt.Sprintf("  (scanning… %d entries)", s.TotalFiles))
 	}
-	b.WriteString(title + "\n\n")
+	b.WriteString(title + "\n")
 
 	if s.TotalBytes > 0 {
 		frac := float64(s.SentBytes+s.SkippedBytes) / float64(s.TotalBytes)
-		b.WriteString(m.bar.ViewAs(frac) + "\n\n")
+		b.WriteString(m.bar.ViewAs(frac) + "\n")
 	} else {
-		b.WriteString(cDim.Render("waiting…") + "\n\n")
+		b.WriteString(cDim.Render("waiting…") + "\n")
 	}
 
 	eta := fmtDuration(s.ETA)
 	if s.ETA <= 0 {
 		eta = "--"
 	}
-	b.WriteString(fmt.Sprintf("  속도 %s/s   남은시간 %s   경과 %s\n",
-		cRate.Render(humanBytes(uint64(s.RateBps))), cEta.Render(eta), cDim.Render(fmtDuration(s.Elapsed))))
-	b.WriteString(fmt.Sprintf("  파일 %d/%d 완료 · 오류 %s · 생략 %s\n\n",
+	b.WriteString(fmt.Sprintf("rate %s/s   eta %s   elapsed %s   files %d/%d done · errors %s · skipped %s\n",
+		cRate.Render(humanBytes(uint64(s.RateBps))), cEta.Render(eta), cDim.Render(fmtDuration(s.Elapsed)),
 		s.DoneFiles+s.SkipFiles, s.TotalFiles, cErrIf(s.ErrFiles), humanBytes(s.SkippedBytes)))
 
 	if len(s.Files) > 0 {
-		b.WriteString(cDim.Render(fmt.Sprintf("  진행 중인 파일 %d", len(s.Files))) + "\n")
-		rows := min(len(s.Files), 8)
+		rows := min(len(s.Files), 4)
 		for i, f := range s.Files {
 			if i >= rows {
-				b.WriteString(cDim.Render(fmt.Sprintf("  … %d more\n", len(s.Files)-rows)))
+				b.WriteString(cDim.Render(fmt.Sprintf("  … %d more in flight\n", len(s.Files)-rows)))
 				break
 			}
 			frac := 1.0
@@ -217,27 +285,72 @@ func (m *clientModel) View() string {
 			if rate > 1 && f.Done < f.Size {
 				feta = fmtDuration(time.Duration(float64(f.Size-f.Done)/rate) * time.Second)
 			}
-			tag := stateTag(f.State, f.Err)
 			b.WriteString(fmt.Sprintf("  %-46s %s %6.1f%% %8s/s %8s\n",
-				cPathSt.Render(truncMid(f.Path, 46)), tag,
+				cPathSt.Render(truncMid(f.Path, 46)), stateTag(f.State, f.Err),
 				frac*100, cFileRate.Render(humanBytes(uint64(rate))), cDim.Render(feta)))
 		}
+	} else if !m.done {
+		b.WriteString(cDim.Render("  …") + "\n")
+	}
+
+	// scrolling transfer log (tail-following; ↑↓ to scroll back)
+	logRows := m.logRows()
+	start := 0
+	end := len(m.events)
+	if m.follow {
+		start = max(0, end-logRows)
+	} else {
+		start = m.logOff
+		end = min(len(m.events), start+logRows)
+	}
+	hdr := "  transfer log"
+	if !m.follow {
+		hdr += cDim.Render(fmt.Sprintf("  (scrolled up %d, End = latest)", len(m.events)-end))
+	}
+	if end-start < logRows { // pad to keep the layout stable
+		hdr += strings.Repeat(" ", 0)
+	}
+	b.WriteString(cLogBox.Render(hdr) + "\n")
+	for _, e := range m.events[start:end] {
+		b.WriteString("  " + e + "\n")
+	}
+	for i := end - start; i < logRows; i++ {
 		b.WriteString("\n")
 	}
 
-	if len(m.events) > 0 {
-		b.WriteString(cDim.Render("  전송 로그") + "\n")
-		for _, e := range m.events {
-			b.WriteString("  " + e + "\n")
-		}
-	}
-	if m.done {
-		verdict := cOk.Render("전송 완료 — 종료합니다")
+	footer := cDim.Render("  [?] help · [↑↓/PgUp/PgDn] scroll log · [Ctrl-C] abort")
+	if m.done && m.waitKey {
 		if m.err != nil {
-			verdict = cErr.Render("중단: " + m.err.Error())
+			footer = cErr.Render("  aborted: ") + cDim.Render(m.err.Error()) + cDim.Render(" — press any key to return to the picker")
+		} else {
+			footer = cOk.Render("  transfer complete") + cDim.Render(" — press any key to return to the picker")
 		}
-		b.WriteString("\n" + verdict + "\n")
+	} else if m.done {
+		footer = cOk.Render("  transfer complete")
 	}
+	b.WriteString(footer + "\n")
+	return b.String()
+}
+
+func (m *clientModel) helpView() string {
+	var b strings.Builder
+	b.WriteString(cBrand.Render(" botjim ") + "진행 화면 도움말\n\n")
+	b.WriteString(`  파일 표가 위로, 전송 로그가 아래로 스크롤됩니다.
+
+  ` + cOk.Render("✔") + ` 파일 전송 완료     ` + cDim.Render("⤼") + ` 이미 있어 생략     ` + cErr.Render("✖") + ` 오류
+  속도/남은시간: 전체 전송 기준 (최근 4초 이동 평균)
+  파일 행: 진행률 · 파일별 속도 · 파일별 남은 시간
+
+  키:
+    ↑ / ↓ / PgUp / PgDn   로그 스크롤 (위로 올리면 자동 추적 멈춤)
+    Home / End            로그 처음 / 최신(자동 추적 재개)
+    ?                     이 도움말
+    Ctrl-C                전송 중단 (재실행 시 이어받기)
+
+  브라우저에서 시작한 전송이 끝나면 아무 키나 눌러 선택 화면으로
+  돌아갑니다. 로그는 파일로도 기록됩니다 (요약에 경로 표시).
+`)
+	b.WriteString("\n" + cDim.Render("아무 키나 누르면 돌아갑니다") + "\n")
 	return b.String()
 }
 

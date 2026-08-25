@@ -26,6 +26,8 @@ var (
 	stExec     = lipgloss.NewStyle().Foreground(lipgloss.Color("114"))
 	stPlain    = lipgloss.NewStyle()
 	stMarkOn   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("82"))
+	stMarkDim  = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	stHidden   = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	stMarkOff  = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
 	stSize     = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	stCursorG  = "▌"
@@ -63,9 +65,11 @@ type browserModel struct {
 	pattern   string // raw input
 	filter    *regexp.Regexp
 	filterErr string
+	help      bool // '?' overlay
 
-	width  int
-	height int
+	width   int
+	height  int
+	lastDir string
 }
 
 type listLoadedMsg struct {
@@ -74,25 +78,30 @@ type listLoadedMsg struct {
 	err     error
 }
 
-// RunBrowser opens the picker and returns the chosen paths (empty when the
-// user quits without marking anything).
-func RunBrowser(ctx context.Context, cfg BrowserConfig) ([]string, error) {
+// RunBrowser opens the picker and returns the chosen paths (empty when
+// the user quits without marking anything) plus the directory the picker
+// was left in, so a send-and-return loop can preserve the user's place.
+func RunBrowser(ctx context.Context, cfg BrowserConfig) (paths []string, lastDir string, err error) {
 	m := &browserModel{cfg: cfg, marked: map[string]bool{}, width: 80, height: 24}
 	if cfg.Pull {
 		m.cwd = ""
 	} else {
-		abs, err := filepath.Abs(".")
-		if err != nil {
-			return nil, err
+		abs := cfg.StartDir
+		if abs == "" {
+			var err error
+			abs, err = filepath.Abs(".")
+			if err != nil {
+				return nil, "", err
+			}
 		}
 		m.cwdLocal = abs
 		m.cwd = abs
 	}
 	p := tea.NewProgram(m, tea.WithOutput(os.Stderr), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return m.result, nil
+	return m.result, m.cwd, nil
 }
 
 func listLocalDir(dir string) ([]protocol.ListEntry, error) {
@@ -168,6 +177,10 @@ func (m *browserModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.KeyMsg:
+		if m.help {
+			m.help = false
+			return m, nil
+		}
 		if m.searching {
 			m.updateSearch(msg)
 			return m, nil
@@ -175,6 +188,7 @@ func (m *browserModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.Type {
 		case tea.KeyCtrlC:
 			m.quitting = true
+			m.lastDir = m.cwdLocal
 			return m, tea.Quit
 		case tea.KeyUp:
 			m.moveCursor(-1)
@@ -203,6 +217,8 @@ func (m *browserModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.reload()
 		}
 		switch msg.String() {
+		case "?":
+			m.help = true
 		case "j":
 			m.moveCursor(1)
 		case "k":
@@ -220,9 +236,7 @@ func (m *browserModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.filterErr = ""
 		case "a":
 			for _, e := range m.view {
-				if !e.IsDir {
-					m.marked[m.join(e.Name)] = true
-				}
+				m.marked[m.join(e.Name)] = true
 			}
 		case "c":
 			m.marked = map[string]bool{}
@@ -230,9 +244,11 @@ func (m *browserModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.clearFilter()
 		case "s":
 			m.send()
+			m.lastDir = m.cwdLocal
 			return m, tea.Quit
 		case "q", "Q", "esc":
 			m.quitting = true
+			m.lastDir = m.cwdLocal
 			return m, tea.Quit
 		case "r":
 			return m, m.reload()
@@ -409,10 +425,9 @@ func (m *browserModel) up() {
 	}
 }
 
+// toggle marks/unmarks an entry. Directories are markable as a whole:
+// the walker sends the entire subtree when given a directory path.
 func (m *browserModel) toggle(e protocol.ListEntry) {
-	if e.IsDir {
-		return // mark files; whole-dir marking via descending + 'a'
-	}
 	key := m.join(e.Name)
 	if m.marked[key] {
 		delete(m.marked, key)
@@ -421,16 +436,41 @@ func (m *browserModel) toggle(e protocol.ListEntry) {
 	}
 }
 
+// inheritedMark reports whether an ancestor of path is marked (the entry
+// is already part of that subtree's transfer).
+func (m *browserModel) inheritedMark(path string) bool {
+	for i := strings.LastIndexByte(path, '/'); i > 0; i = strings.LastIndexByte(path[:i], '/') {
+		if m.marked[path[:i]] {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *browserModel) send() {
 	var out []string
 	for p := range m.marked {
 		out = append(out, p)
 	}
 	sort.Strings(out)
-	m.result = out
+	// a marked directory already covers its subtree: drop redundant
+	// descendants so nothing is sent twice
+	deduped := out[:0]
+	var lastKept string
+	for _, p := range out {
+		if lastKept != "" && strings.HasPrefix(p, lastKept+"/") {
+			continue
+		}
+		deduped = append(deduped, p)
+		lastKept = p
+	}
+	m.result = deduped
 }
 
 func (m *browserModel) View() string {
+	if m.help {
+		return m.helpView()
+	}
 	var b strings.Builder
 	mode := "push local"
 	if m.cfg.Pull {
@@ -472,7 +512,7 @@ func (m *browserModel) View() string {
 			stStatus.Render("  "+pos+scrollHint(m)) + "\n")
 	}
 
-	keys := stKey.Render("↑↓/jk") + " move · " + stKey.Render("space") + " mark · " +
+	keys := stKey.Render("↑↓/jk") + " move · " + stKey.Render("space") + " mark (dirs too) · " +
 		stKey.Render("enter") + " open · " + stKey.Render("/") + " find · " +
 		stKey.Render("u") + " parent · " + stKey.Render("a") + " all · " +
 		stKey.Render("c") + " clear · " + stKey.Render("s") + " send · " + stKey.Render("q") + " quit"
@@ -488,10 +528,14 @@ func (m *browserModel) renderRow(i int) string {
 	if i == m.cursor {
 		cursorCol = stCursorG
 	}
+	key := m.join(e.Name)
 	var mark string
-	if m.marked[m.join(e.Name)] {
+	switch {
+	case m.marked[key]:
 		mark = stMarkOn.Render("✔")
-	} else {
+	case m.inheritedMark(key):
+		mark = stMarkDim.Render("✔") // covered by a marked parent
+	default:
 		mark = stMarkOff.Render("·")
 	}
 	kind, nameStyle := "-", stPlain
@@ -502,6 +546,9 @@ func (m *browserModel) renderRow(i int) string {
 		kind, nameStyle = "~", stSymlink
 	case e.Mode&0o111 != 0:
 		kind, nameStyle = "*", stExec
+	}
+	if strings.HasPrefix(e.Name, ".") {
+		nameStyle = stHidden // dotfiles stay visible, just quieter
 	}
 	name := m.renderName(e.Name, nameStyle)
 
@@ -605,6 +652,26 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func (m *browserModel) helpView() string {
+	return stBrand.Render(" botjim ") + `browser help
+
+  move      ↑↓ / j k · PgUp PgDn · Home End · g G (top/bottom)
+  mark      space — files AND directories (a marked directory sends its
+            whole subtree); ✔ explicit mark · ✔ dim = covered by a
+            marked parent
+  dirs      enter to descend · u (or Backspace) to go up
+  filter    / regex search — live count, match highlighting; Enter
+            keeps, Esc clears
+  bulk      a mark everything visible · c clear marks
+  send      s send selection — returns here when done
+  misc      r refresh · ? this help · q quit
+
+  colors    d dir · ~ symlink · * exec · dim = hidden (dot) file
+
+` + stStatus.Render("press any key to go back") + "\n" +
+		stStatus.Render("(이동 j/k · 선택 space(폴더 포함) · 검색 / · 전송 s · 종료 q)") + "\n"
 }
 
 func sizeOrDir(e protocol.ListEntry) string {

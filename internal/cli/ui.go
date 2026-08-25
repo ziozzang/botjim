@@ -17,10 +17,11 @@ import (
 // terminal, a single refresh line under --no-tui, nothing under -q. It owns
 // the main goroutine for the TUI case (the engine runs underneath).
 type clientUI struct {
-	reg  *progress.Registry
-	pull bool
-	f    *flags
-	line *lineUI
+	reg     *progress.Registry
+	pull    bool
+	f       *flags
+	line    *lineUI
+	waitKey bool // after completion, hold the final screen for a keypress
 }
 
 func newClientUI(f *flags, reg *progress.Registry, pull bool) *clientUI {
@@ -41,23 +42,29 @@ func (u *clientUI) Run(ctx context.Context, cancel context.CancelFunc, call func
 		lu.Close()
 		return res
 	}
-	resCh := make(chan session.ClientResult, 1)
-	go func() { resCh <- call() }()
+	// The result is shared state guarded by resDone: the done-forwarder
+	// must not consume it out from under the return path (that deadlock
+	// held every browser-flow transfer open after its final keypress).
+	var res session.ClientResult
+	resDone := make(chan struct{})
+	go func() {
+		res = call()
+		close(resDone)
+	}()
 	done := make(chan error, 1)
 	go func() {
-		res := <-resCh
+		<-resDone
 		done <- res.Err
 	}()
-	_ = tui.RunClientProgress(ctx, u.reg, u.pull, done)
+	_ = tui.RunClientProgress(ctx, u.reg, u.pull, done, u.waitKey)
 	// if the TUI exited before the transfer finished, the user quit: abort
 	select {
-	case res := <-resCh:
-		return res
+	case <-resDone:
 	default:
 		cancel()
-		res := <-resCh
-		return res
+		<-resDone
 	}
+	return res
 }
 
 // lineUI is the --no-tui single-line progress renderer.

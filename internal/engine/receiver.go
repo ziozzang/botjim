@@ -121,7 +121,9 @@ func (r *Receiver) discoverPartsOnce(abs string) (part, meta string, stale []str
 			}
 		}
 	}
-	names := r.partsByDir[dir]
+	// copy under the lock: mutators below are copy-on-write, but an
+	// in-place filter would race readers iterating the old backing array
+	names := append([]string(nil), r.partsByDir[dir]...)
 	r.partIdxMu.Unlock()
 
 	prefix := base + sidecar.PartPrefix
@@ -177,7 +179,12 @@ func (r *Receiver) trackPart(abs, base string) {
 		}
 	}
 	if !found {
-		r.partsByDir[dir] = append(r.partsByDir[dir], base)
+		// copy-on-write: never append into a backing array a reader may
+		// still be iterating
+		next := make([]string, 0, len(r.partsByDir[dir])+1)
+		next = append(next, r.partsByDir[dir]...)
+		next = append(next, base)
+		r.partsByDir[dir] = next
 	}
 	r.partIdxMu.Unlock()
 }
@@ -187,7 +194,7 @@ func (r *Receiver) forgetParts(abs string, names ...string) {
 	dir, base := filepath.Split(abs)
 	dir = filepath.Clean(dir)
 	r.partIdxMu.Lock()
-	keep := r.partsByDir[dir][:0]
+	keep := make([]string, 0, len(r.partsByDir[dir]))
 	for _, n := range r.partsByDir[dir] {
 		drop := false
 		for _, d := range names {
@@ -200,7 +207,7 @@ func (r *Receiver) forgetParts(abs string, names ...string) {
 			keep = append(keep, n)
 		}
 	}
-	r.partsByDir[dir] = keep
+	r.partsByDir[dir] = keep // fresh slice: readers keep the old one intact
 	r.partIdxMu.Unlock()
 }
 

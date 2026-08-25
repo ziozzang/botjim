@@ -334,12 +334,19 @@ func runClient(ctx context.Context, f *flags) int {
 		dir = protocol.DirPull
 	}
 	cfg, reg := buildClientConfig(f, addr, alg, resume, owners, paths)
+	logPath := openTransferLog(f, reg)
+	if logPath != "" {
+		defer closeTransferLog()
+	}
+	reg.Emit("info", "", fmt.Sprintf("transfer start (%s, %d paths)", directionName(f.pull), len(paths)))
 	rctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	ui := newClientUI(f, reg, dir == protocol.DirPull)
 	res := ui.Run(rctx, cancel, func() session.ClientResult {
 		return session.RunWithProgress(rctx, cfg, reg)
 	})
+	reg.Emit("info", "", fmt.Sprintf("transfer end: %d files, %d bytes, %d errors",
+		res.Report.Files, res.Report.Bytes, len(res.Report.Errors)))
 
 	rep := res.Report
 	fmt.Fprintf(os.Stderr, "\n%d files, %s transferred", rep.Files, humanBytes(rep.Bytes))
@@ -347,6 +354,9 @@ func runClient(ctx context.Context, f *flags) int {
 		fmt.Fprintf(os.Stderr, ", %s skipped (already present)", humanBytes(rep.SkippedBytes))
 	}
 	fmt.Fprintln(os.Stderr)
+	if logPath != "" {
+		fmt.Fprintf(os.Stderr, "transfer log: %s\n", logPath)
+	}
 	for _, fe := range rep.Errors {
 		fmt.Fprintf(os.Stderr, "  error: %s: %s\n", fe.Path, fe.Msg)
 	}

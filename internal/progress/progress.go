@@ -8,6 +8,8 @@
 package progress
 
 import (
+	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -69,6 +71,17 @@ type Registry struct {
 	rateHist []ratePoint
 
 	Events chan Event
+
+	logMu sync.Mutex
+	logW  io.Writer // optional persistent transfer log
+}
+
+// SetLogWriter installs a plain-text sink: every event is appended there
+// in addition to the in-memory channel (the TUI consumes the channel).
+func (r *Registry) SetLogWriter(w io.Writer) {
+	r.logMu.Lock()
+	r.logW = w
+	r.logMu.Unlock()
 }
 
 type fileRow struct {
@@ -149,10 +162,17 @@ func (r *Registry) SentBytes() uint64 { return r.sentBytes.Load() }
 // AddSkipped accumulates bytes not moved (already present).
 func (r *Registry) AddSkipped(n int64) { r.skippedBytes.Add(uint64(n)) }
 
-// Emit queues a discrete event; drops (never blocks) when the queue is full.
+// Emit queues a discrete event; drops (never blocks) when the queue is
+// full, and appends a timestamped line to the persistent log sink.
 func (r *Registry) Emit(kind, path, msg string) {
+	now := time.Now()
+	if r.logW != nil {
+		r.logMu.Lock()
+		fmt.Fprintf(r.logW, "%s %-10s %s %s\n", now.Format(time.RFC3339), kind, path, msg)
+		r.logMu.Unlock()
+	}
 	select {
-	case r.Events <- Event{Kind: kind, Path: path, Msg: msg, At: time.Now()}:
+	case r.Events <- Event{Kind: kind, Path: path, Msg: msg, At: now}:
 	default:
 	}
 }

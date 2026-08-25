@@ -44,6 +44,7 @@ type dashModel struct {
 	conns     int
 	started   time.Time
 	quitting  bool
+	help      bool // '?' overlay
 	lastRate  float64
 }
 
@@ -96,12 +97,18 @@ func (m *dashModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refresh()
 		return m, dashTickCmd()
 	case tea.KeyMsg:
+		if m.help {
+			m.help = false
+			return m, nil
+		}
 		switch msg.Type {
 		case tea.KeyCtrlC, tea.KeyEsc:
 			m.quitting = true
 			return m, tea.Quit
 		}
 		switch msg.String() {
+		case "?":
+			m.help = true
 		case "q", "Q":
 			m.quitting = true
 			return m, tea.Quit
@@ -173,6 +180,18 @@ func (m *dashModel) refresh() {
 }
 
 func (m *dashModel) View() string {
+	if m.help {
+		return dBrand.Render(" botjim ") + `server dashboard help
+
+  per connection: progress bar · file counts · rate sparkline
+  file rows: percent · per-file speed · per-file remaining time
+  top sparkline: aggregate throughput across all connections
+
+  keys: q / Ctrl-C stop the server · ? this help
+
+` + dDim.Render("press any key to go back") + "\n" +
+			dDim.Render("(처리량 스파크라인 · 파일별 속도/남은시간 · q 종료)") + "\n"
+	}
 	var b strings.Builder
 	b.WriteString(dBrand.Render(" botjim ") + "server — live dashboard\n\n")
 	b.WriteString(fmt.Sprintf("connections %d · uptime %s\n\n", m.conns, fmtDuration(time.Since(m.started))))
@@ -226,7 +245,7 @@ func (m *dashModel) View() string {
 			b.WriteString("  " + truncEnd(l, 74) + "\n")
 		}
 	}
-	b.WriteString("\n" + dDim.Render("[q] quit · plain V1 — trusted networks only") + "\n")
+	b.WriteString("\n" + dDim.Render("[?] help · [q] quit · plain V1 — trusted networks only") + "\n")
 	if m.quitting {
 		b.WriteString("shutting down…\n")
 	}

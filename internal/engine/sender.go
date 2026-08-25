@@ -440,9 +440,9 @@ func (s *Sender) fileResult(m protocol.FileResult) {
 			}
 		}
 	} else {
+		// non-data entries (dirs, symlinks, nodes) have no useful log line
 		if m.Status != protocol.ResultError {
 			s.report.Files++
-			s.reg.Emit("file-done", fmt.Sprintf("entry#%d", m.FileID), "")
 		}
 		s.reg.FileStateUpdate(m.FileID, "done", "")
 	}

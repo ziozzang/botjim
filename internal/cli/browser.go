@@ -3,7 +3,11 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
+	"sync"
+	"time"
 
 	"github.com/ziozzang/botjim/internal/attrs"
 	"github.com/ziozzang/botjim/internal/compress"
@@ -43,37 +47,106 @@ func runBrowser(ctx context.Context, f *flags, addr string, alg uint8, resume ui
 		fmt.Fprintln(os.Stderr, "browser needs a terminal; pass explicit PATHs for non-interactive use")
 		return 3
 	}
-	sel, err := tui.RunBrowser(ctx, tui.BrowserConfig{
-		Addr: addr,
-		Pull: f.pull,
-		Dest: f.dest,
-	})
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "browser:", err)
-		return 2
-	}
-	if len(sel) == 0 {
-		return 0
-	}
-	cfg, reg := buildClientConfig(f, addr, alg, resume, owners, sel)
-	rctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	ui := newClientUI(f, reg, f.pull)
-	res := ui.Run(rctx, cancel, func() session.ClientResult {
-		return session.RunWithProgress(rctx, cfg, reg)
-	})
+	// send-and-return loop: after each transfer the picker reopens where
+	// it was left, until the user quits with q
+	startDir := ""
+	for {
+		sel, lastDir, err := tui.RunBrowser(ctx, tui.BrowserConfig{
+			Addr:     addr,
+			Pull:     f.pull,
+			Dest:     f.dest,
+			StartDir: startDir,
+		})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "browser:", err)
+			return 2
+		}
+		startDir = lastDir
+		if len(sel) == 0 {
+			return 0
+		}
+		cfg, reg := buildClientConfig(f, addr, alg, resume, owners, sel)
+		logPath := openTransferLog(f, reg)
+		reg.Emit("info", "", fmt.Sprintf("transfer start (%s, %d paths)", directionName(f.pull), len(sel)))
+		rctx, cancel := context.WithCancel(ctx)
+		ui := newClientUI(f, reg, f.pull)
+		ui.waitKey = true
+		res := ui.Run(rctx, cancel, func() session.ClientResult {
+			return session.RunWithProgress(rctx, cfg, reg)
+		})
+		cancel()
+		reg.Emit("info", "", fmt.Sprintf("transfer end: %d files, %d bytes, %d errors",
+			res.Report.Files, res.Report.Bytes, len(res.Report.Errors)))
 
-	rep := res.Report
-	fmt.Fprintf(os.Stderr, "%d files, %s transferred\n", rep.Files, humanBytes(rep.Bytes))
-	for _, fe := range rep.Errors {
-		fmt.Fprintf(os.Stderr, "  error: %s: %s\n", fe.Path, fe.Msg)
+		rep := res.Report
+		fmt.Fprintf(os.Stderr, "%d files, %s transferred\n", rep.Files, humanBytes(rep.Bytes))
+		for _, fe := range rep.Errors {
+			fmt.Fprintf(os.Stderr, "  error: %s: %s\n", fe.Path, fe.Msg)
+		}
+		if logPath != "" {
+			fmt.Fprintf(os.Stderr, "transfer log: %s\n", logPath)
+		}
+		if res.Err != nil {
+			fmt.Fprintln(os.Stderr, "transfer error:", res.Err)
+		}
+		closeTransferLog()
+		// let the previous bubbletea program finish restoring the
+		// terminal before the next one claims it (sequential-program race)
+		time.Sleep(250 * time.Millisecond)
 	}
-	if res.Err != nil {
-		fmt.Fprintln(os.Stderr, "transfer error:", res.Err)
-		return 2
+}
+
+func directionName(pull bool) string {
+	if pull {
+		return "pull"
 	}
-	if len(rep.Errors) > 0 {
-		return 1
+	return "push"
+}
+
+// openTransferLog wires the registry's persistent event sink; the path is
+// reported back for the final summary. --log-file overrides the default
+// location under the user cache dir.
+func openTransferLog(f *flags, reg *progress.Registry) string {
+	path := f.logFile
+	if path == "" {
+		dir, err := os.UserCacheDir()
+		if err != nil {
+			return ""
+		}
+		path = filepath.Join(dir, "botjim", "transfers.log")
 	}
-	return 0
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return ""
+	}
+	w, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return ""
+	}
+	transferLogMu.Lock()
+	transferLogFile = w
+	transferLogMu.Unlock()
+	reg.SetLogWriter(lockingWriter{w})
+	return path
+}
+
+var (
+	transferLogMu   sync.Mutex
+	transferLogFile *os.File
+)
+
+type lockingWriter struct{ w io.Writer }
+
+func (l lockingWriter) Write(p []byte) (int, error) {
+	transferLogMu.Lock()
+	defer transferLogMu.Unlock()
+	return l.w.Write(p)
+}
+
+func closeTransferLog() {
+	transferLogMu.Lock()
+	if transferLogFile != nil {
+		_ = transferLogFile.Close()
+		transferLogFile = nil
+	}
+	transferLogMu.Unlock()
 }
