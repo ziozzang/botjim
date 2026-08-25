@@ -30,7 +30,8 @@ sleep 0.6
 fail=0
 for iter in $(seq 1 "$ITER"); do
   delay=$(python3 -c "import random; print(round(random.uniform(0.05, 0.5), 3))")
-  ( cd "$SRC" && "$BIN" -c 127.0.0.1:$PORT --no-tui -q . 2>/dev/null ) &
+  # exec makes the subshell become botjim, so $! is the real client pid
+  bash -c "cd '$SRC' && exec '$BIN' -c 127.0.0.1:$PORT --no-tui -q ." >/dev/null 2>&1 &
   client=$!
   sleep "$delay"
   if kill -0 $client 2>/dev/null; then
@@ -40,14 +41,19 @@ for iter in $(seq 1 "$ITER"); do
     killed=no
   fi
   wait $client 2>/dev/null
-  # wait for the server to release part locks (session unwind)
+  # wait until no part file in the destination is still locked by the
+  # unwinding server-side session of the killed client
   for _ in $(seq 1 100); do
-    locked=$(fuser "$DST"/*".fs-part-"* 2>/dev/null | wc -w)
-    [ "$locked" -eq 0 ] && break
+    any_locked=0
+    for p in "$DST"/*fs-part-*; do
+      [ -e "$p" ] || continue
+      flock -n "$p" true 2>/dev/null || any_locked=1
+    done
+    [ "$any_locked" -eq 0 ] && break
     sleep 0.05
   done
   # resume
-  ( cd "$SRC" && "$BIN" -c 127.0.0.1:$PORT --no-tui -q . 2>"$WORK/resume.err" )
+  bash -c "cd '$SRC' && exec '$BIN' -c 127.0.0.1:$PORT --no-tui -q ." 2>"$WORK/resume.err"
   rc=$?
   if [ $rc -ne 0 ]; then
     echo "iter $iter (kill=$killed delay=$delay): resume FAILED rc=$rc"
@@ -57,9 +63,7 @@ for iter in $(seq 1 "$ITER"); do
   fi
   # verify
   ( cd "$DST" && find . -type f -print0 | sort -z | xargs -0 sha256sum ) > "$WORK/got.sha"
-  # manifest paths are identical (same tree layout, '.' root)
-  if ! diff -q <(sed "s|$SRC/||" "$WORK/manifest.sha" 2>/dev/null || sed 's|\./||' "$WORK/manifest.sha") \
-               <(sed 's|\./||' "$WORK/got.sha") >/dev/null; then
+  if ! diff -q <(sed 's|\./||' "$WORK/manifest.sha") <(sed 's|\./||' "$WORK/got.sha") >/dev/null; then
     echo "iter $iter: HASH MISMATCH"
     diff <(sed 's|\./||' "$WORK/manifest.sha") <(sed 's|\./||' "$WORK/got.sha") | head -5
     fail=1
@@ -76,8 +80,9 @@ for iter in $(seq 1 "$ITER"); do
 done
 if [ $fail -eq 0 ]; then
   echo "kill9 suite: ALL $ITER PASSED"
+  cleanup
   exit 0
 fi
 echo "kill9 suite: FAILED (state kept at $WORK)"
-trap - EXIT
+pkill -f "botjim -s .* -p $PORT" 2>/dev/null
 exit 1

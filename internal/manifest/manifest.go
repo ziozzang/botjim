@@ -123,6 +123,10 @@ type Skipped struct {
 type Walker struct {
 	Opts   WalkOpts
 	OnSkip func(Skipped)
+	// Home, when set, maps any root equal to it to the manifest-relative
+	// "." — pulling "." mirrors the jail root's content instead of
+	// wrapping it in the root's basename.
+	Home string
 
 	uidNames map[string]string
 	gidNames map[string]string
@@ -145,6 +149,14 @@ func (w *Walker) Walk(ctx context.Context, roots []string, emit func(Entry) erro
 	bases, err := RelBase(roots)
 	if err != nil {
 		return err
+	}
+	if w.Home != "" {
+		home := filepath.Clean(w.Home)
+		for _, root := range roots {
+			if filepath.Clean(root) == home {
+				bases[root] = "."
+			}
+		}
 	}
 	for _, root := range roots {
 		rootInfo, err := os.Lstat(root)

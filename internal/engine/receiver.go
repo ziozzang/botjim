@@ -707,10 +707,14 @@ func (r *Receiver) finalize(id uint32) {
 }
 
 // pruneStaleParts removes leftover parts (and their sidecars) for an
-// already-final path — abandoned by interrupted earlier sessions. Parts
-// still locked by a live session are left alone.
+// already-final path — abandoned by interrupted earlier sessions. The
+// winner was renamed into place, so everything still matching the part
+// pattern is garbage; parts locked by a live session are left alone.
 func (r *Receiver) pruneStaleParts(abs string) {
-	_, _, stale := sidecar.Discover(abs)
+	part, _, stale := sidecar.Discover(abs)
+	if part != "" {
+		removeIfUnlocked(part)
+	}
 	for _, s := range stale {
 		removeIfUnlocked(s)
 	}
@@ -793,7 +797,16 @@ func (r *Receiver) maybePostPass(final bool) {
 	r.postRan = true
 	jobs := append([]hardlinkJob(nil), r.hardlinks...)
 	dirs := append([]manifest.Entry(nil), r.dirs...)
-	report := &r.report
+	type doneFile struct {
+		id  uint32
+		abs string
+	}
+	var finals []doneFile
+	for id, f := range r.files {
+		if f.resolved && !f.errored && f.partPath != "" {
+			finals = append(finals, doneFile{id, f.abs})
+		}
+	}
 	r.mu.Unlock()
 
 	for _, j := range jobs {
@@ -827,7 +840,6 @@ func (r *Receiver) maybePostPass(final bool) {
 		}
 		r.reg.FileStateUpdate(e.ID, "done", "")
 		r.okEntry(e, "")
-		_ = report
 	}
 
 	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i].RelPath) > len(dirs[j].RelPath) })
@@ -840,6 +852,11 @@ func (r *Receiver) maybePostPass(final bool) {
 		for _, w := range attrs.ApplyPath(abs, e, r.opts.OwnerPolicy) {
 			r.warn(w.String())
 		}
+	}
+	// final sweep: retry leftover pruning for every finalized file — parts
+	// owned by a concurrently-dying session may only become lockable now
+	for _, df := range finals {
+		r.pruneStaleParts(df.abs)
 	}
 	if !final {
 		r.kickCompletion()

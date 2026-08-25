@@ -25,10 +25,13 @@ const (
 
 // RelOK validates a manifest-relative path component-wise: '/' separated,
 // no leading '/', no '.', '..', empty or NUL-containing component, sane
-// length. It is the gate in front of SafeJoin.
+// length. The lone path "." (the root itself) is legal.
 func RelOK(rel string) error {
 	if rel == "" {
 		return errors.New("empty path")
+	}
+	if rel == "." {
+		return nil
 	}
 	if len(rel) > maxPath {
 		return fmt.Errorf("path too long (%d bytes)", len(rel))
@@ -61,6 +64,9 @@ func RelOK(rel string) error {
 func SafeJoin(root, rel string) (string, error) {
 	if err := RelOK(rel); err != nil {
 		return "", err
+	}
+	if rel == "." {
+		return root, nil
 	}
 	joined := filepath.Join(root, rel)
 	if !strings.HasPrefix(joined, root+string(filepath.Separator)) {

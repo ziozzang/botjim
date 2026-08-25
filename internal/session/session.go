@@ -250,14 +250,17 @@ func (s *Server) runTransfer(sess *transport.Session, ctrl *protocol.CtrlStream,
 		return report, err
 	}
 
-	// pull: resolve requested roots inside the jail
+	// pull: resolve requested roots inside the jail; failures must reach
+	// the client as a refused ack (never leave it waiting)
 	var roots []string
 	for _, p := range init.Paths {
 		abs, err := fsutil.SafeJoin(s.cfg.Root, p)
 		if err != nil {
+			_ = ctrl.Send(protocol.MsgTransferAck, 0, ack(false, engine.CodeInvalidPath, fmt.Sprintf("pull path %q: %v", p, err)))
 			return engine.Report{}, fmt.Errorf("pull path %q: %w", p, err)
 		}
 		if _, err := os.Lstat(abs); err != nil {
+			_ = ctrl.Send(protocol.MsgTransferAck, 0, ack(false, engine.CodeIO, fmt.Sprintf("pull path %q: %v", p, err)))
 			return engine.Report{}, fmt.Errorf("pull path %q: %w", p, err)
 		}
 		roots = append(roots, abs)
@@ -266,6 +269,7 @@ func (s *Server) runTransfer(sess *transport.Session, ctrl *protocol.CtrlStream,
 		return engine.Report{}, fmt.Errorf("pull with no paths")
 	}
 	s.Log("%s pull start (parallel %d, %s)", remote, opts.Parallel, algName(opts.Compression))
+	opts.RelHome = s.cfg.Root // "." pulls mirror the jail root's content
 	send := engine.NewSender(sess, ctrl, opts, reg, roots)
 	report, err := send.Run(ctx)
 	s.Log("%s pull done: %d files, %d bytes, %d errors (cancelled=%v)", remote, report.Files, report.Bytes+report.SkippedBytes, len(report.Errors), report.Cancelled)
@@ -394,9 +398,12 @@ func RunWithProgress(ctx context.Context, cfg ClientConfig, reg *progress.Regist
 	if err := ctrl.Send(protocol.MsgInitTransfer, 0, init.Encode()); err != nil {
 		return ClientResult{Err: err}
 	}
+	// the ack must come promptly; a server that never answers is a hard error
+	_ = ctrlConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	frame, err := ctrl.Recv(nil)
+	_ = ctrlConn.SetReadDeadline(time.Time{})
 	if err != nil {
-		return ClientResult{Err: err}
+		return ClientResult{Err: fmt.Errorf("waiting for ack: %w", err)}
 	}
 	if frame.Type != protocol.MsgTransferAck {
 		return ClientResult{Err: fmt.Errorf("expected ack, got 0x%02x", frame.Type)}

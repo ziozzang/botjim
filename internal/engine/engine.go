@@ -23,6 +23,7 @@ type Options struct {
 	Fsync       bool
 	OwnerPolicy attrs.OwnerPolicy
 	Nonce       string // session nonce hex — suffix for new part files
+	RelHome     string // sender side: root that maps to manifest "."
 }
 
 // FileError is one failed file in the report.

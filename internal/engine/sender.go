@@ -123,7 +123,7 @@ func (s *Sender) Run(ctx context.Context) (Report, error) {
 	}()
 
 	s.reg.SetScanning(true)
-	walker := &manifest.Walker{Opts: s.walkOpts()}
+	walker := &manifest.Walker{Opts: s.walkOpts(), Home: s.opts.RelHome}
 	walker.OnSkip = func(sk manifest.Skipped) {
 		s.reg.Emit("warn", sk.Path, sk.Why)
 		s.report.Warnings = append(s.report.Warnings, fmt.Sprintf("skip %s: %s", sk.Path, sk.Why))
