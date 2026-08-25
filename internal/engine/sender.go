@@ -44,6 +44,7 @@ type Sender struct {
 
 	taskCh  chan chunkTask
 	kick    chan struct{}
+	readyQ  []uint32 // gate-opened files awaiting task enqueue
 	report  Report
 	batchMu sync.Mutex
 	batch   []manifest.Entry
@@ -239,14 +240,19 @@ func (s *Sender) walk(ctx context.Context, walker *manifest.Walker) error {
 			s.reg.AddFile(e.ID, e.RelPath, 0)
 			s.mu.Lock()
 		}
-		for s.gatesOpen >= senderPendingCredit {
-			if ctx.Err() != nil {
-				s.mu.Unlock()
-				return ctx.Err()
+		// credit is consumed by data-carrying files only: every regular
+		// file gets exactly one HaveBitmap back, while dirs/symlinks/nodes
+		// resolve via FileResult and would otherwise leak a slot forever
+		if e.Kind == manifest.KindRegular {
+			for s.gatesOpen >= senderPendingCredit {
+				if ctx.Err() != nil {
+					s.mu.Unlock()
+					return ctx.Err()
+				}
+				s.gateCond.Wait()
 			}
-			s.gateCond.Wait()
+			s.gatesOpen++
 		}
-		s.gatesOpen++
 		s.mu.Unlock()
 		s.appendBatch(e)
 		return nil
@@ -387,6 +393,9 @@ func (s *Sender) gateOpen(m protocol.HaveBitmap) {
 		s.gatesOpen--
 		s.gateCond.Signal()
 	}
+	if !f.errored && !f.resolved && !f.allSkip {
+		s.readyQ = append(s.readyQ, m.FileID)
+	}
 	s.mu.Unlock()
 	s.kickScheduler()
 }
@@ -508,7 +517,11 @@ func (s *Sender) sendError(scope uint8, code uint16, msg string) {
 }
 
 // runScheduler feeds missing (not-have) chunks of gated files to the workers.
+// runScheduler feeds missing (not-have) chunks of gated files to the
+// workers. Gate-opened files enter readyQ so the scheduler never rescans
+// the whole file table (that made many-file transfers quadratic).
 func (s *Sender) runScheduler(ctx context.Context) {
+	var backlog []uint32
 	for {
 		select {
 		case <-ctx.Done():
@@ -517,13 +530,23 @@ func (s *Sender) runScheduler(ctx context.Context) {
 			return
 		default:
 		}
+		if len(backlog) == 0 {
+			s.mu.Lock()
+			backlog = append(backlog, s.readyQ...)
+			s.readyQ = s.readyQ[:0]
+			s.mu.Unlock()
+		}
 		progressed := false
-		s.mu.Lock()
-		for _, f := range s.files {
-			if f.errored || f.resolved || f.allSkip || f.have == nil {
-				continue
+	remaining:
+		for len(backlog) > 0 {
+			id := backlog[0]
+			s.mu.Lock()
+			f := s.files[id]
+			if f == nil || f.errored || f.resolved || f.allSkip || f.have == nil {
+				s.mu.Unlock()
+				backlog = backlog[1:]
+				continue remaining
 			}
-		fileTasks:
 			for f.nextTask < f.count {
 				if bitTest(f.have, f.nextTask) {
 					f.nextTask++
@@ -536,19 +559,31 @@ func (s *Sender) runScheduler(ctx context.Context) {
 					f.inflight++
 					progressed = true
 				default:
-					break fileTasks
+					s.mu.Unlock()
+					break remaining // channel full: keep the head for later
 				}
 			}
+			s.mu.Unlock()
+			backlog = backlog[1:]
 		}
-		s.mu.Unlock()
-		if !progressed {
+		if !progressed || len(backlog) > 0 {
 			select {
 			case <-ctx.Done():
 				return
 			case <-s.ctrlDone:
 				return
 			case <-s.kick:
-			case <-time.After(25 * time.Millisecond):
+			case <-time.After(5 * time.Millisecond):
+			}
+		} else {
+			// drained everything; wait for the next gate opening
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.ctrlDone:
+				return
+			case <-s.kick:
+			case <-time.After(50 * time.Millisecond):
 			}
 		}
 	}

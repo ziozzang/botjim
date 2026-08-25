@@ -57,6 +57,14 @@ type Receiver struct {
 	doneOnce   sync.Once
 	doneSent   atomic.Bool
 	ctrlDone   chan struct{}
+
+	// partIndex answers "which parts exist in this directory" from one
+	// readdir per directory instead of a glob per file (the glob made
+	// many-file transfers quadratic).
+	partIdxMu  sync.Mutex
+	partDirs   map[string]bool     // directories already scanned
+	partsByDir map[string][]string // dir → part basenames (session-visible)
+
 }
 
 type rxFile struct {
@@ -90,7 +98,110 @@ func NewReceiver(sess *transport.Session, ctrl *protocol.CtrlStream, opts Option
 		finalizeCh: make(chan uint32, 128),
 		kick:       make(chan struct{}, 1),
 		ctrlDone:   make(chan struct{}),
+		partDirs:   map[string]bool{},
+		partsByDir: map[string][]string{},
 	}
+}
+
+// discoverPartsOnce finds existing part files for a final path with one
+// directory scan per directory per session. It returns the newest part
+// (empty when none), whether a sidecar exists for it, and older parts.
+func (r *Receiver) discoverPartsOnce(abs string) (part, meta string, stale []string) {
+	dir, base := filepath.Split(abs)
+	dir = filepath.Clean(dir)
+	r.partIdxMu.Lock()
+	if !r.partDirs[dir] {
+		r.partDirs[dir] = true
+		if entries, err := os.ReadDir(dir); err == nil {
+			for _, de := range entries {
+				n := de.Name()
+				if strings.Contains(n, sidecar.PartPrefix) {
+					r.partsByDir[dir] = append(r.partsByDir[dir], n)
+				}
+			}
+		}
+	}
+	names := r.partsByDir[dir]
+	r.partIdxMu.Unlock()
+
+	prefix := base + sidecar.PartPrefix
+	var cands []string
+	for _, n := range names {
+		if strings.HasPrefix(n, prefix) {
+			cands = append(cands, n)
+		}
+	}
+	if len(cands) == 0 {
+		return "", "", nil
+	}
+	newest := ""
+	var newestMt int64
+	var newestSz int64
+	for _, n := range cands {
+		fi, err := os.Stat(filepath.Join(dir, n))
+		if err != nil {
+			continue
+		}
+		mt, sz := fi.ModTime().UnixNano(), fi.Size()
+		if mt > newestMt || (mt == newestMt && sz > newestSz) {
+			newest, newestMt, newestSz = n, mt, sz
+		}
+	}
+	if newest == "" {
+		return "", "", nil
+	}
+	part = filepath.Join(dir, newest)
+	meta = sidecar.MetaPathForPart(part)
+	if _, err := os.Stat(meta); err != nil {
+		meta = ""
+	}
+	for _, n := range cands {
+		if n != newest {
+			stale = append(stale, filepath.Join(dir, n))
+		}
+	}
+	return part, meta, stale
+}
+
+// trackPart records a part created or adopted by this session so later
+// lookups (pruning, removal) see it without another directory scan.
+func (r *Receiver) trackPart(abs, base string) {
+	dir, _ := filepath.Split(abs)
+	dir = filepath.Clean(dir)
+	r.partIdxMu.Lock()
+	found := false
+	for _, n := range r.partsByDir[dir] {
+		if n == base {
+			found = true
+			break
+		}
+	}
+	if !found {
+		r.partsByDir[dir] = append(r.partsByDir[dir], base)
+	}
+	r.partIdxMu.Unlock()
+}
+
+// forgetParts drops part names from the index (after rename/removal).
+func (r *Receiver) forgetParts(abs string, names ...string) {
+	dir, base := filepath.Split(abs)
+	dir = filepath.Clean(dir)
+	r.partIdxMu.Lock()
+	keep := r.partsByDir[dir][:0]
+	for _, n := range r.partsByDir[dir] {
+		drop := false
+		for _, d := range names {
+			if n == d || (d == "" && strings.HasPrefix(n, base+sidecar.PartPrefix)) {
+				drop = true
+				break
+			}
+		}
+		if !drop {
+			keep = append(keep, n)
+		}
+	}
+	r.partsByDir[dir] = keep
+	r.partIdxMu.Unlock()
 }
 
 // Run drives the receiver until the transfer completes or the connection dies.
@@ -346,11 +457,11 @@ func (r *Receiver) prepareRegular(ctx context.Context, e manifest.Entry) {
 	f := &rxFile{entry: e, abs: abs, retries: map[uint64]int{}}
 	strict := r.opts.Resume == 0
 
-	// resume discovery
+	// resume discovery (indexed: one scan per directory, not a glob per file)
 	if r.opts.Resume == 2 {
 		r.removeParts(abs)
 	}
-	part, meta, stale := sidecar.Discover(abs)
+	part, meta, stale := r.discoverPartsOnce(abs)
 	for _, s := range stale {
 		_ = os.Remove(s)
 		_ = os.Remove(sidecar.MetaPathForPart(s))
@@ -395,6 +506,7 @@ func (r *Receiver) prepareRegular(ctx context.Context, e manifest.Entry) {
 		r.failEntry(e, CodeIO, "part: "+err.Error())
 		return
 	}
+	r.trackPart(abs, filepath.Base(part))
 	f.part = pf
 
 	// verify have-bits by re-hashing the part (bitmap is a hint; data rules).
@@ -406,11 +518,14 @@ func (r *Receiver) prepareRegular(ctx context.Context, e manifest.Entry) {
 	if !sc.FullyWritten && (sc.HaveCount() > 0 || (partExisted && !scHadSidecar)) {
 		resumed = r.rehashPart(f, e, grid, partExisted && !scHadSidecar)
 	}
-	r.sendHave(e.ID, protocol.HavePartial, sc.Bitmap())
 
+	// register BEFORE the bitmap goes out: the sender may stream chunks the
+	// instant it has the have-information, and an unregistered file would
+	// drop them on the floor
 	r.mu.Lock()
 	r.files[e.ID] = f
 	r.mu.Unlock()
+	r.sendHave(e.ID, protocol.HavePartial, sc.Bitmap())
 	if resumed > 0 {
 		r.reg.AddSkipped(resumed)
 		r.reg.FileDoneBytes(e.ID, resumed)
@@ -693,10 +808,12 @@ func (r *Receiver) finalize(id uint32) {
 		return
 	}
 	_ = os.Remove(sidecar.MetaPathForPart(f.partPath))
-	_, _, stale := sidecar.Discover(f.abs)
+	r.forgetParts(f.abs, filepath.Base(f.partPath))
+	_, _, stale := r.discoverPartsOnce(f.abs)
 	for _, s := range stale {
-		_ = os.Remove(s)
-		_ = os.Remove(sidecar.MetaPathForPart(s))
+		if removeIfUnlocked(s) {
+			r.forgetParts(f.abs, filepath.Base(s))
+		}
 	}
 	f.mu.Lock()
 	f.dirty = false
@@ -711,28 +828,35 @@ func (r *Receiver) finalize(id uint32) {
 // winner was renamed into place, so everything still matching the part
 // pattern is garbage; parts locked by a live session are left alone.
 func (r *Receiver) pruneStaleParts(abs string) {
-	part, _, stale := sidecar.Discover(abs)
-	if part != "" {
-		removeIfUnlocked(part)
+	part, _, stale := r.discoverPartsOnce(abs)
+	removed := make([]string, 0, len(stale)+1)
+	if part != "" && removeIfUnlocked(part) {
+		removed = append(removed, filepath.Base(part))
 	}
 	for _, s := range stale {
-		removeIfUnlocked(s)
+		if removeIfUnlocked(s) {
+			removed = append(removed, filepath.Base(s))
+		}
+	}
+	if len(removed) > 0 {
+		r.forgetParts(abs, removed...)
 	}
 }
 
-func removeIfUnlocked(part string) {
+func removeIfUnlocked(part string) bool {
 	pf, err := os.OpenFile(part, os.O_RDWR, 0o600)
 	if err != nil {
 		_ = os.Remove(part) // gone or unreadable: nothing to protect
 		_ = os.Remove(sidecar.MetaPathForPart(part))
-		return
+		return true
 	}
 	defer pf.Close()
 	if err := unix.Flock(int(pf.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		return // owned by a live session
+		return false // owned by a live session
 	}
 	_ = os.Remove(part)
 	_ = os.Remove(sidecar.MetaPathForPart(part))
+	return true
 }
 
 // watchCompletion triggers the post-pass and the Done/Goodbye handshake.
@@ -1068,7 +1192,7 @@ func (r *Receiver) abortParts() {
 }
 
 func (r *Receiver) removeParts(abs string) {
-	part, meta, stale := sidecar.Discover(abs)
+	part, meta, stale := r.discoverPartsOnce(abs)
 	for _, p := range append([]string{part}, stale...) {
 		if p != "" {
 			_ = os.Remove(p)
@@ -1077,6 +1201,9 @@ func (r *Receiver) removeParts(abs string) {
 	}
 	if meta != "" {
 		_ = os.Remove(meta)
+	}
+	if part != "" {
+		r.forgetParts(abs)
 	}
 }
 

@@ -48,7 +48,9 @@ docker run -d --name "$CLI" --network "$NET" -v "$WORK:/work" alpine:latest slee
 sleep 1
 
 echo "== server container: waiting mode =="
-docker exec -d "$SRV" sh -c "/work/botjim -s --root /data -p $PORT --no-tui > /work/server.log 2>&1"
+# the server decides ownership policy (clients cannot dictate uids);
+# numeric so the container-root chown round-trips
+docker exec -d "$SRV" sh -c "/work/botjim -s --root /data -p $PORT --no-tui --map-owners numeric > /work/server.log 2>&1"
 sleep 1.5
 docker exec "$CLI" /work/botjim -c "$SRV:$PORT" --probe --no-tui || { echo "probe failed"; docker logs "$SRV" | tail -5; exit 1; }
 
@@ -63,7 +65,9 @@ else
 fi
 
 echo "== root-privilege attributes inside container (chown/ownership) =="
-docker exec "$CLI" sh -c "cd /push && chown 8:12 plain.txt && chmod 4755 plain.txt"
+# touch -m as well: ownership-only changes don't move mtime, and an
+# unchanged size+mtime file is legitimately all-skipped
+docker exec "$CLI" sh -c "cd /push && chown 8:12 plain.txt && chmod 4755 plain.txt && touch -m plain.txt"
 docker exec "$CLI" sh -c "cd /push && /work/botjim -c $SRV:$PORT --no-tui -q --map-owners numeric plain.txt"
 docker exec "$SRV" stat -c '%n %u:%g %A' /data/plain.txt
 docker exec "$SRV" sh -c 'stat -c "%u:%g %A" /data/plain.txt | grep -q "^8:12 -rwsr-xr-x$"' || { echo "owner/mode not preserved"; fail=1; }
