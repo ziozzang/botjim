@@ -314,14 +314,15 @@ func (w *Walker) entryFor(path string, info os.FileInfo, rel string) (*Entry, st
 	if !ok {
 		st = &syscall.Stat_t{}
 	}
+	mt, at := statTimes(st)
 	e := &Entry{
 		RelPath: rel,
 		AbsPath: path,
 		Mode:    uint32(st.Mode),
 		UID:     st.Uid,
 		GID:     st.Gid,
-		Mtime:   Timespec{Sec: st.Mtim.Sec, Nsec: uint32(st.Mtim.Nsec)},
-		Atime:   Timespec{Sec: st.Atim.Sec, Nsec: uint32(st.Atim.Nsec)},
+		Mtime:   mt,
+		Atime:   at,
 		Dev:     uint64(st.Dev),
 		Ino:     uint64(st.Ino),
 	}

@@ -14,8 +14,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-
-	"golang.org/x/sys/unix"
 )
 
 const (
@@ -221,23 +219,6 @@ func matchSegs(p, n []string, isDir bool) (bool, error) {
 		return false, err
 	}
 	return matchSegs(p[1:], n[1:], isDir)
-}
-
-// OpenNoAtime opens name for reading without updating its atime. O_NOATIME
-// requires ownership or CAP_FOWNER; on EPERM it silently falls back to a
-// plain open (relatime makes the update a non-issue in most setups).
-func OpenNoAtime(name string) (*os.File, error) {
-	fd, err := unix.Open(name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOATIME, 0)
-	if err != nil {
-		if err == unix.EPERM || err == unix.EACCES {
-			return os.Open(name)
-		}
-		if err == unix.ENOENT {
-			return nil, os.ErrNotExist
-		}
-		return nil, err
-	}
-	return os.NewFile(uintptr(fd), name), nil
 }
 
 // FileExists reports a plain existence probe by Lstat.
