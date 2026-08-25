@@ -31,12 +31,14 @@ type Sender struct {
 	reg   *progress.Registry
 	roots []string
 
-	mu        sync.Mutex
-	files     map[uint32]*txFile
-	emitted   uint64 // entries handed to the walker emit (all kinds)
-	resolved  uint64 // entries with a terminal outcome (echoed or local)
-	gatesOpen int
-	gateCond  *sync.Cond
+	mu          sync.Mutex
+	files       map[uint32]*txFile
+	emittedIDs  map[uint32]bool // every entry ID the walker assigned
+	resolvedIDs map[uint32]bool
+	emitted     uint64 // entries handed to the walker emit (all kinds)
+	resolved    uint64 // entries with a terminal outcome (echoed or local)
+	gatesOpen   int
+	gateCond    *sync.Cond
 
 	manifestBytes uint64
 	dirs          uint64
@@ -78,10 +80,12 @@ type txFile struct {
 func NewSender(sess *transport.Session, ctrl *protocol.CtrlStream, opts Options, reg *progress.Registry, roots []string) *Sender {
 	s := &Sender{
 		sess: sess, ctrl: ctrl, opts: opts, reg: reg, roots: roots,
-		files:    map[uint32]*txFile{},
-		taskCh:   make(chan chunkTask, opts.Parallel*2),
-		kick:     make(chan struct{}, 1),
-		ctrlDone: make(chan struct{}),
+		files:       map[uint32]*txFile{},
+		emittedIDs:  map[uint32]bool{},
+		resolvedIDs: map[uint32]bool{},
+		taskCh:      make(chan chunkTask, opts.Parallel*2),
+		kick:        make(chan struct{}, 1),
+		ctrlDone:    make(chan struct{}),
 	}
 	s.gateCond = sync.NewCond(&s.mu)
 	return s
@@ -223,6 +227,7 @@ func (s *Sender) walk(ctx context.Context, walker *manifest.Walker) error {
 		}
 		s.mu.Lock()
 		s.emitted++
+		s.emittedIDs[e.ID] = true
 		if e.Kind == manifest.KindDir {
 			s.dirs++
 		}
@@ -403,6 +408,12 @@ func (s *Sender) gateOpen(m protocol.HaveBitmap) {
 // fileResult resolves an entry by receiver echo.
 func (s *Sender) fileResult(m protocol.FileResult) {
 	s.mu.Lock()
+	// unknown or already-resolved IDs are dropped: counting them would let
+	// a hostile receiver inflate the report and hold the stall timer open
+	if !s.emittedIDs[m.FileID] || s.resolvedIDs[m.FileID] {
+		s.mu.Unlock()
+		return
+	}
 	f := s.files[m.FileID]
 	if f != nil {
 		// release walker credit when the outcome arrived before the bitmap
@@ -413,29 +424,29 @@ func (s *Sender) fileResult(m protocol.FileResult) {
 			}
 			s.gateCond.Signal()
 		}
-		if !f.errored && !f.resolved {
-			f.resolved = true
-			if m.Status == protocol.ResultError {
-				s.report.Errors = append(s.report.Errors, FileError{Path: f.entry.RelPath, Code: m.Code, Msg: m.Msg})
-				s.reg.FileStateUpdate(f.entry.ID, "error", m.Msg)
+		if m.Status == protocol.ResultError && !f.errored {
+			f.errored = true
+			s.report.Errors = append(s.report.Errors, FileError{Path: f.entry.RelPath, Code: m.Code, Msg: m.Msg})
+			s.reg.FileStateUpdate(f.entry.ID, "error", m.Msg)
+		} else if !f.resolved {
+			s.report.Files++
+			if m.Status == protocol.ResultSkip {
+				s.reg.FileStateUpdate(f.entry.ID, "skipped", "")
 			} else {
-				s.report.Files++
-				if m.Status == protocol.ResultSkip {
-					s.reg.FileStateUpdate(f.entry.ID, "skipped", "")
-				} else {
-					s.reg.FileStateUpdate(f.entry.ID, "done", "")
-				}
+				s.reg.FileStateUpdate(f.entry.ID, "done", "")
 			}
-			s.resolved++
 		}
 	} else {
-		// non-data entry (dir/symlink/node/hardlink): count its echo directly
-		s.resolved++
 		if m.Status != protocol.ResultError {
 			s.report.Files++
 		}
 		s.reg.FileStateUpdate(m.FileID, "done", "")
 	}
+	if f != nil {
+		f.resolved = true
+	}
+	s.resolvedIDs[m.FileID] = true
+	s.resolved++
 	s.mu.Unlock()
 	s.maybeCloseFD(f)
 }
@@ -491,7 +502,12 @@ func (s *Sender) failFile(f *txFile, code uint16, msg string) {
 		return
 	}
 	f.errored = true
+	if f.resolved || s.resolvedIDs[f.entry.ID] {
+		s.mu.Unlock()
+		return
+	}
 	f.resolved = true
+	s.resolvedIDs[f.entry.ID] = true
 	if f.have == nil && !f.allSkip {
 		s.gatesOpen--
 		if s.gatesOpen < 0 {

@@ -80,12 +80,13 @@ func NewHandshake(features uint64) (*Handshake, error) {
 	return h, nil
 }
 
-// NonceHex renders the first 8 nonce bytes as hex — the per-session suffix
-// used for part/sidecar file names on the receiving side.
+// NonceHex renders the first 8 nonce bytes (64 bits) as hex — the
+// per-session suffix used for part/sidecar file names on the receiving
+// side.
 func (h *Handshake) NonceHex() string {
 	const hexd = "0123456789abcdef"
-	out := make([]byte, 0, 8)
-	for _, b := range h.Nonce[:4] {
+	out := make([]byte, 0, 16)
+	for _, b := range h.Nonce[:8] {
 		out = append(out, hexd[b>>4], hexd[b&0xF])
 	}
 	return string(out)
@@ -123,6 +124,12 @@ func ReadHandshake(r io.Reader) (*Handshake, error) {
 	}
 	if buf[4] != ProtoMajor {
 		return nil, fmt.Errorf("protocol major mismatch: peer %d, us %d", buf[4], ProtoMajor)
+	}
+	if buf[6] != CipherPlain {
+		return nil, fmt.Errorf("unsupported cipher id %d (this build speaks plaintext only)", buf[6])
+	}
+	if buf[7] != 0 {
+		return nil, fmt.Errorf("unsupported handshake flags %#x", buf[7])
 	}
 	h := &Handshake{
 		ProtoMajor:  buf[4],

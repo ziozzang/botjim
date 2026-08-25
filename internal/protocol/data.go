@@ -24,6 +24,11 @@ const (
 
 const frameChunkType uint8 = 0x20
 
+// maxChunkPayload bounds a pre-allocated chunk buffer: the largest chunk
+// is 16MiB and compressed output never exceeds it by contract (raw
+// fallback), so anything larger is protocol abuse.
+const maxChunkPayload = 17<<20 + 4096
+
 // DataStream frames one yamux stream carrying chunk frames. One stream is
 // owned by exactly one sender worker / receiver handler goroutine.
 type DataStream struct {
@@ -75,7 +80,7 @@ func (s *DataStream) WriteChunk(h ChunkHeader, payload []byte) error {
 	if uint64(len(payload)) != h.PayloadLen {
 		return fmt.Errorf("payload length mismatch: header %d, actual %d", h.PayloadLen, len(payload))
 	}
-	var hdr [4 + binary.MaxVarintLen64*2]byte
+	var hdr [2 + 3*binary.MaxVarintLen64]byte
 	hdr[0] = frameChunkType
 	n := 1
 	n += binary.PutUvarint(hdr[n:], uint64(h.FileID))
@@ -120,7 +125,7 @@ func (s *DataStream) ReadChunk() (ChunkHeader, []byte, error) {
 	if err != nil {
 		return ChunkHeader{}, nil, err
 	}
-	if plen > 1<<30 {
+	if plen > maxChunkPayload {
 		return ChunkHeader{}, nil, fmt.Errorf("chunk payload too large: %d", plen)
 	}
 	h := ChunkHeader{FileID: uint32(fileID), ChunkIdx: idx, Flags: flags, PayloadLen: plen}

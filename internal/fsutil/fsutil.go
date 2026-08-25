@@ -67,10 +67,39 @@ func SafeJoin(root, rel string) (string, error) {
 		return root, nil
 	}
 	joined := filepath.Join(root, rel)
+	if root == string(filepath.Separator) {
+		return joined, nil // the filesystem root prefixes everything
+	}
 	if !strings.HasPrefix(joined, root+string(filepath.Separator)) {
 		return "", fmt.Errorf("path %q escapes root", rel)
 	}
 	return joined, nil
+}
+
+// CheckNoSymlinkComponents verifies that no component of root/rel —
+// including the final one — is a symlink. Lexical SafeJoin alone cannot
+// see through intermediate symlinks (Lstat follows them), so every
+// remotely-controlled read path goes through this too.
+func CheckNoSymlinkComponents(root, rel string) error {
+	if rel == "" || rel == "." {
+		return nil
+	}
+	if err := RelOK(rel); err != nil {
+		return err
+	}
+	parts := strings.Split(rel, "/")
+	cur := root
+	for _, p := range parts {
+		cur = filepath.Join(cur, p)
+		fi, err := os.Lstat(cur)
+		if err != nil {
+			return nil // does not exist yet: nothing to follow
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%q traverses a symlink", rel)
+		}
+	}
+	return nil
 }
 
 // ResolveRoot makes root absolute, symlink-free and existing. A root that

@@ -126,20 +126,20 @@ func MakeSymlink(abs string, e manifest.Entry) error {
 	return os.Symlink(e.LinkTarget, abs)
 }
 
-// MakeNode creates a fifo or device node.
+// MakeNode creates a fifo or device node. The mode is assembled from raw
+// POSIX bits (perm + setuid/setgid/sticky) plus the node-type bits —
+// passing os.FileMode's own bit layout to mknod produces a regular file
+// with garbled permissions.
 func MakeNode(abs string, e manifest.Entry) error {
-	mode := goMode(e.Mode)
-	var dev uint64
+	mode := rawModeBits(e.Mode)
 	var err error
 	switch e.Kind {
 	case manifest.KindFIFO:
-		err = unix.Mkfifo(abs, uint32(mode))
+		err = unix.Mkfifo(abs, mode)
 	case manifest.KindCharDev:
-		dev = e.Rdev
-		err = unix.Mknod(abs, uint32(mode), int(dev))
+		err = unix.Mknod(abs, mode|unix.S_IFCHR, int(e.Rdev))
 	case manifest.KindBlockDev:
-		dev = e.Rdev
-		err = unix.Mknod(abs, uint32(mode), int(dev))
+		err = unix.Mknod(abs, mode|unix.S_IFBLK, int(e.Rdev))
 	default:
 		return fmt.Errorf("not a special node: %v", e.Kind)
 	}
@@ -150,6 +150,21 @@ func MakeNode(abs string, e manifest.Entry) error {
 		return err
 	}
 	return nil
+}
+
+// rawModeBits extracts perm + setuid/setgid/sticky from a full POSIX mode.
+func rawModeBits(m uint32) uint32 {
+	out := m & 0o777
+	if m&0o4000 != 0 {
+		out |= unix.S_ISUID
+	}
+	if m&0o2000 != 0 {
+		out |= unix.S_ISGID
+	}
+	if m&0o1000 != 0 {
+		out |= unix.S_ISVTX
+	}
+	return out
 }
 
 // MakeHardlink links src (already-finalized file) to dst.

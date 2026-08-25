@@ -211,13 +211,42 @@ func (s *Server) runTransfer(sess *transport.Session, ctrl *protocol.CtrlStream,
 		_ = ctrl.Send(protocol.MsgTransferAck, 0, ack(false, engine.CodeProtocol, "bad parallel"))
 		return engine.Report{}, fmt.Errorf("bad parallel %d", init.Parallel)
 	}
+	// pull roots are validated before the ack: the client acts on the
+	// first TransferAck it sees, so a later refusal would be invisible
+	var pullRoots []string
+	if init.Dir == protocol.DirPull {
+		for _, p := range init.Paths {
+			abs, err := fsutil.SafeJoin(s.cfg.Root, p)
+			if err == nil {
+				err = fsutil.CheckNoSymlinkComponents(s.cfg.Root, p)
+			}
+			if err == nil {
+				if _, lerr := os.Lstat(abs); lerr != nil {
+					err = lerr
+				}
+			}
+			if err != nil {
+				_ = ctrl.Send(protocol.MsgTransferAck, 0, ack(false, engine.CodeInvalidPath, fmt.Sprintf("pull path %q: %v", p, err)))
+				return engine.Report{}, fmt.Errorf("pull path %q: %w", p, err)
+			}
+			pullRoots = append(pullRoots, abs)
+		}
+		if len(pullRoots) == 0 {
+			_ = ctrl.Send(protocol.MsgTransferAck, 0, ack(false, engine.CodeProtocol, "pull with no paths"))
+			return engine.Report{}, fmt.Errorf("pull with no paths")
+		}
+	}
 	_ = ctrl.Send(protocol.MsgTransferAck, 0, ack(true, 0, ""))
 
+	par := int(init.Parallel)
+	if s.cfg.Parallel > 0 && par > s.cfg.Parallel {
+		par = s.cfg.Parallel // the server, not the client, caps its streams
+	}
 	opts := engine.Options{
 		Direction:   init.Dir,
 		Compression: clampAlg(init.Compression),
 		ZstdLevel:   int(init.ZstdLevel),
-		Parallel:    int(init.Parallel),
+		Parallel:    par,
 		Resume:      init.Resume,
 		Preserve:    init.Preserve,
 		Fsync:       s.cfg.Fsync,
@@ -250,24 +279,7 @@ func (s *Server) runTransfer(sess *transport.Session, ctrl *protocol.CtrlStream,
 		return report, err
 	}
 
-	// pull: resolve requested roots inside the jail; failures must reach
-	// the client as a refused ack (never leave it waiting)
-	var roots []string
-	for _, p := range init.Paths {
-		abs, err := fsutil.SafeJoin(s.cfg.Root, p)
-		if err != nil {
-			_ = ctrl.Send(protocol.MsgTransferAck, 0, ack(false, engine.CodeInvalidPath, fmt.Sprintf("pull path %q: %v", p, err)))
-			return engine.Report{}, fmt.Errorf("pull path %q: %w", p, err)
-		}
-		if _, err := os.Lstat(abs); err != nil {
-			_ = ctrl.Send(protocol.MsgTransferAck, 0, ack(false, engine.CodeIO, fmt.Sprintf("pull path %q: %v", p, err)))
-			return engine.Report{}, fmt.Errorf("pull path %q: %w", p, err)
-		}
-		roots = append(roots, abs)
-	}
-	if len(roots) == 0 {
-		return engine.Report{}, fmt.Errorf("pull with no paths")
-	}
+	roots := pullRoots
 	s.Log("%s pull start (parallel %d, %s)", remote, opts.Parallel, algName(opts.Compression))
 	opts.RelHome = s.cfg.Root // "." pulls mirror the jail root's content
 	send := engine.NewSender(sess, ctrl, opts, reg, roots)
@@ -285,6 +297,9 @@ func (s *Server) serveList(ctrl *protocol.CtrlStream, payload []byte) {
 	base := s.cfg.Root
 	if req.Path != "" && req.Path != "." {
 		p, err := fsutil.SafeJoin(s.cfg.Root, req.Path)
+		if err == nil {
+			err = fsutil.CheckNoSymlinkComponents(s.cfg.Root, req.Path)
+		}
 		if err != nil {
 			_ = ctrl.Send(protocol.MsgListResp, 0, emptyList().Encode())
 			return

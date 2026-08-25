@@ -206,7 +206,7 @@ func DownloadVerified(ctx context.Context, client *http.Client, asset Asset, wan
 	}
 	tmpName := tmp.Name()
 	h := sha256.New()
-	if _, err := io.Copy(io.MultiWriter(tmp, h), resp.Body); err != nil {
+	if _, err := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(resp.Body, 200<<20)); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
 		return "", err

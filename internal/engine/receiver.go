@@ -236,16 +236,15 @@ func (r *Receiver) Run(ctx context.Context) (Report, error) {
 	// data accept loop (this goroutine)
 	accErr := r.acceptLoop(wctx)
 
-	// sidecar flush on the way out, then release every remaining part lock
-	// (part fds must not wait for GC — the flock guards cross-session
-	// adoption and a later run must be able to take over)
-	r.flushAllSidecars()
-	r.closeAllParts()
-
+	// drain pending finalizes while the part fds are still open, then
+	// flush sidecars and release every remaining part lock (part fds must
+	// not wait for GC — the flock guards cross-session adoption)
 	cancel()
 	close(r.rehashCh)
 	rwg.Wait()
 	r.drainFinalize()
+	r.flushAllSidecars()
+	r.closeAllParts()
 
 	var retErr error
 	for _, ch := range []chan error{ctrlErr, finErr, accErrCh(accErr)} {
@@ -257,7 +256,7 @@ func (r *Receiver) Run(ctx context.Context) (Report, error) {
 	r.mu.Lock()
 	report := r.report
 	cancelled := report.Cancelled
-	completed := r.manifestDone && r.total > 0 && r.resolved >= r.total
+	completed := r.manifestDone && r.resolved >= r.total
 	r.mu.Unlock()
 	if wctx.Err() != nil && !cancelled && !completed && retErr == nil {
 		retErr = wctx.Err()
@@ -322,6 +321,7 @@ func (r *Receiver) readCtrl(ctx context.Context, cancel context.CancelFunc) erro
 			r.report.Cancelled = true
 			r.mu.Unlock()
 			r.flushAllSidecars()
+			cancel() // unwind acceptLoop too — the peer may keep the socket open
 			return nil
 		case protocol.MsgAbort:
 			r.mu.Lock()
@@ -349,6 +349,21 @@ func (r *Receiver) processEntry(ctx context.Context, e manifest.Entry) {
 		return
 	}
 	r.reg.AddFile(e.ID, e.RelPath, e.Size)
+	// the manifest is remote input: its grid fields are suggestions until
+	// normalized. Without this, a crafted entry panics the process
+	// (sidecar allocates Size/ChunkSize slices) or OOMs it.
+	if e.Kind == manifest.KindRegular {
+		if e.Size < 0 || e.Size > maxTransferFileSize {
+			r.failEntry(e, CodeInvalidPath, fmt.Sprintf("implausible size %d", e.Size))
+			return
+		}
+		grid := chunking.NewGrid(e.Size, e.ChunkSize)
+		if grid.ChunkSize != chunking.ChunkSizeFor(e.Size) || grid.Count() > maxChunksPerFile {
+			r.failEntry(e, CodeInvalidPath, "implausible chunk grid")
+			return
+		}
+		e.ChunkSize = grid.ChunkSize
+	}
 	abs, err := fsutil.SafeJoin(r.root, e.RelPath)
 	if err != nil {
 		r.failEntry(e, CodeInvalidPath, err.Error())
@@ -358,7 +373,7 @@ func (r *Receiver) processEntry(ctx context.Context, e manifest.Entry) {
 		r.failEntry(e, CodeInvalidPath, err.Error())
 		return
 	}
-	if prev, dup := r.caseSeen[strings.ToLower(e.RelPath)]; dup {
+	if prev, dup := r.caseSeen[asciiLower(e.RelPath)]; dup {
 		if prev != e.RelPath {
 			r.failEntry(e, CodeInvalidPath, fmt.Sprintf("case collision with %q (case-insensitive target?)", prev))
 			return
@@ -367,6 +382,7 @@ func (r *Receiver) processEntry(ctx context.Context, e manifest.Entry) {
 		// entry owns the destination; this one is skipped without data.
 		r.sendHave(e.ID, protocol.HaveAllSkip, nil)
 		r.reg.FileStateUpdate(e.ID, "skipped", "")
+		r.registerStub(e, abs)
 		r.mu.Lock()
 		r.resolved++
 		r.mu.Unlock()
@@ -375,12 +391,20 @@ func (r *Receiver) processEntry(ctx context.Context, e manifest.Entry) {
 		return
 	}
 	r.mu.Lock()
-	r.caseSeen[strings.ToLower(e.RelPath)] = e.RelPath
+	r.caseSeen[asciiLower(e.RelPath)] = e.RelPath
 	r.mu.Unlock()
 
 	switch e.Kind {
 	case manifest.KindDir:
-		if err := os.MkdirAll(abs, 0o700); err != nil && !os.IsExist(err) {
+		// a pre-existing path here must be a real directory, never a
+		// symlink to one — MkdirAll would happily follow it and every
+		// child would then land outside the jail
+		if fi, err := os.Lstat(abs); err == nil {
+			if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+				r.failEntry(e, CodeInvalidPath, "path exists and is not a directory created by botjim")
+				return
+			}
+		} else if err := os.MkdirAll(abs, 0o700); err != nil {
 			r.failEntry(e, CodeIO, err.Error())
 			return
 		}
@@ -611,7 +635,20 @@ func (r *Receiver) rehashPart(f *rxFile, e manifest.Entry, grid chunking.Grid, r
 
 // writeEmpty creates a zero-length final file with its attributes.
 func (r *Receiver) writeEmpty(abs string, e manifest.Entry) {
-	fd, err := os.OpenFile(abs, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	// never follow a symlink at the final path: O_TRUNC would clobber a
+	// file outside the jail. O_NOFOLLOW refuses symlinks (ELOOP); a
+	// leftover one is removed and retried once, mirroring the
+	// part→rename flow which replaces rather than follows.
+	fd, err := openFinalNoFollow(abs)
+	if errors.Is(err, unix.ELOOP) {
+		if fi, lerr := os.Lstat(abs); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+			if rmErr := os.Remove(abs); rmErr != nil {
+				r.failEntry(e, CodeIO, "symlink in the way: "+rmErr.Error())
+				return
+			}
+			fd, err = openFinalNoFollow(abs)
+		}
+	}
 	if err != nil {
 		r.failEntry(e, CodeIO, err.Error())
 		return
@@ -621,12 +658,24 @@ func (r *Receiver) writeEmpty(abs string, e manifest.Entry) {
 		r.warn(w.String())
 	}
 	r.reg.FileStateUpdate(e.ID, "done", "")
+	r.registerStub(e, abs) // hardlink targets may reference this entry
 	r.okEntry(e, "")
+}
+
+// registerStub records an entry that finalized without a part file, so
+// post-pass hardlinks can still resolve its destination path.
+func (r *Receiver) registerStub(e manifest.Entry, abs string) {
+	r.mu.Lock()
+	if _, ok := r.files[e.ID]; !ok {
+		r.files[e.ID] = &rxFile{entry: e, abs: abs, resolved: true}
+	}
+	r.mu.Unlock()
 }
 
 // acceptLoop drains accepted data streams into chunk handlers.
 func (r *Receiver) acceptLoop(ctx context.Context) error {
 	var wg sync.WaitGroup
+	streams := make(chan struct{}, r.opts.Parallel*4)
 	for {
 		conn, err := r.sess.AcceptStreamCtx(ctx)
 		if err != nil {
@@ -636,9 +685,16 @@ func (r *Receiver) acceptLoop(ctx context.Context) error {
 			}
 			return nil // session ended
 		}
+		select {
+		case streams <- struct{}{}:
+		default:
+			_ = conn.Close() // stream flood: refuse beyond the cap
+			continue
+		}
 		wg.Add(1)
 		go func(c net.Conn) {
 			defer wg.Done()
+			defer func() { <-streams }()
 			r.handleStream(ctx, c)
 		}(conn)
 	}
@@ -778,20 +834,27 @@ func (r *Receiver) finalize(id uint32) {
 		return
 	}
 	e := f.entry
+	f.mu.Lock()
+	part := f.part
+	f.part = nil
+	f.mu.Unlock()
+	if part == nil {
+		return // session teardown closed it: do not finalize half-state
+	}
 	if r.opts.Fsync {
-		if err := f.part.Sync(); err != nil {
+		if err := part.Sync(); err != nil {
+			_ = part.Close()
 			r.failFile(f, CodeIO, "fsync: "+err.Error())
 			return
 		}
 	}
-	for _, w := range attrs.ApplyFile(f.part, f.partPath, e, r.opts.OwnerPolicy) {
+	for _, w := range attrs.ApplyFile(part, f.partPath, e, r.opts.OwnerPolicy) {
 		r.warn(w.String())
 	}
-	if err := f.part.Close(); err != nil {
+	if err := part.Close(); err != nil {
 		r.failFile(f, CodeIO, "close: "+err.Error())
 		return
 	}
-	f.part = nil
 	// record completion (sidecar first: a crash between these steps is
 	// repaired by the next run's all-skip + prune), then swap into place
 	// and drop the sidecar and any stale siblings
@@ -1232,6 +1295,19 @@ func (r *Receiver) drainFinalize() {
 	}
 }
 
+// asciiLower lower-cases ASCII only: Unicode case folding (Kelvin sign,
+// long s) would reject legitimate distinct filenames on case-sensitive
+// filesystems.
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
+}
+
 func nonceOf(partPath string) string {
 	base := filepath.Base(partPath)
 	if i := strings.Index(base, sidecar.PartPrefix); i >= 0 {
@@ -1242,6 +1318,24 @@ func nonceOf(partPath string) string {
 
 // errPartLocked marks a part held by another live session.
 var errPartLocked = errors.New("part owned by another session")
+
+// Sanity ceilings for remotely-supplied entry geometry: a 16EiB lie must
+// fail the entry, not the process. 16TiB/1M chunks cover any real file on
+// any filesystem botjim targets.
+const (
+	maxTransferFileSize = 16 << 40
+	maxChunksPerFile    = 1 << 20
+)
+
+// openFinalNoFollow creates/truncates a zero-length final file without
+// ever following a symlink at the last component.
+func openFinalNoFollow(abs string) (*os.File, error) {
+	fd, err := unix.Open(abs, unix.O_WRONLY|unix.O_CREAT|unix.O_TRUNC|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), abs), nil
+}
 
 // openPartLocked opens (creating if needed) a part file sized to size and
 // holds an exclusive non-blocking flock on it for the session's lifetime.
