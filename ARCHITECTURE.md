@@ -311,6 +311,12 @@ the engine's token/encryption.
   must not launch the TUI)
 - harnesses: attribute preservation vs a `tar` snapshot, kill -9 resume
   suite (random interruption points × N), docker container E2E
+  (`test/containers.sh`: push/pull/attrs/chown/resume across two Alpine
+  containers), plus container suites for auth v2 (token/pass/cloak accept
+  + reject matrix), the multi-container torrent mesh (tracker + seed +
+  4 joiners, seed killed mid-run and the swarm completes peer-to-peer),
+  relay/broker e2ee pairing (three containers), and transfer + resume
+  under injected latency/loss (`netem` 40ms + 1% loss)
 - `-race` across all packages; benchmarks against `tar | nc`
 
 ## Self-update authenticity (v0.11)
