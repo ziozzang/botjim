@@ -2,8 +2,10 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"sync"
@@ -26,11 +28,12 @@ const senderPendingCredit = 2048
 
 // Sender streams a manifest and its chunk data over the session's streams.
 type Sender struct {
-	sess  *transport.Session
-	ctrl  *protocol.CtrlStream
-	opts  Options
-	reg   *progress.Registry
-	roots []string
+	sess   *transport.Session
+	ctrl   *protocol.CtrlStream
+	opts   Options
+	reg    *progress.Registry
+	roots  []string
+	manSHA atomic.Pointer[[32]byte] // digest of the manifest as sent
 
 	mu          sync.Mutex
 	files       map[uint32]*txFile
@@ -47,6 +50,7 @@ type Sender struct {
 
 	taskCh  chan chunkTask
 	reqCh   chan chunkTask // request-driven tasks (fanout/swarm source)
+	manHash hash.Hash      // running manifest digest (sender side)
 	kick    chan struct{}
 	limiter *limiter
 	dryRun  bool
@@ -110,6 +114,22 @@ func NewSender(sess *transport.Session, ctrl *protocol.CtrlStream, opts Options,
 		s.dryRun = true
 	}
 	return s
+}
+
+// ManifestDigest returns the SHA-256 over the manifest entries as they
+// were encoded on the wire — the receipt identity of what was sent.
+func (s *Sender) ManifestDigest() (hex string, ok bool) {
+	p := s.manSHA.Load()
+	if p == nil {
+		return "", false
+	}
+	const hx = "0123456789abcdef"
+	out := make([]byte, 64)
+	for i, b := range p[:] {
+		out[i*2] = hx[b>>4]
+		out[i*2+1] = hx[b&0xF]
+	}
+	return string(out), true
 }
 
 // Plan returns the dry-run rows (only after Run completes with --dry-run).
@@ -176,6 +196,15 @@ func (s *Sender) Run(ctx context.Context) (Report, error) {
 	if err := s.ctrl.Send(protocol.MsgManifestEnd, 0,
 		protocol.ManifestEnd{Files: files, Bytes: bytes, Dirs: dirs, HasHardlinks: hl}.Encode()); err != nil && !isCtxErr(err) {
 		s.setFatal(err)
+	}
+	{
+		s.batchMu.Lock()
+		if s.manHash != nil {
+			var d [32]byte
+			copy(d[:], s.manHash.Sum(nil))
+			s.manSHA.Store(&d)
+		}
+		s.batchMu.Unlock()
 	}
 	s.reg.SetScanning(false)
 
@@ -302,6 +331,10 @@ func (s *Sender) appendBatch(e manifest.Entry) {
 	s.batchMu.Lock()
 	defer s.batchMu.Unlock()
 	enc := protocol.EncodeEntry(&e)
+	if s.manHash == nil {
+		s.manHash = sha256.New()
+	}
+	s.manHash.Write(enc)
 	if len(s.batch) >= 256 || s.batchSz+len(enc) > 1<<20 {
 		s.flushBatchLocked()
 	}

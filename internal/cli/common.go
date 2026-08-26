@@ -30,6 +30,9 @@ func preserveBits(f *flags) uint16 {
 	if f.owners == "name" {
 		p |= protocol.PreserveUname
 	}
+	if f.deleteDst {
+		p |= protocol.PreserveDelete
+	}
 	return p
 }
 

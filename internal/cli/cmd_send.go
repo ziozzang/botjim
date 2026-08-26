@@ -89,8 +89,42 @@ func cmdSend(args []string, pull bool) int {
 	if f.jsonOut {
 		jsonEvents = true
 	}
+	// named endpoint: resolve before running (config < explicit flags)
+	if fs.NArg() > 0 || f.via == "" {
+		host := f.client
+		if host == "" && len(positionals) > 0 {
+			host = positionals[0]
+		}
+		if cfg := loadConfigQuiet(); cfg != nil {
+			if ep, ok := cfg.ResolveEndpoint(host); ok {
+				f.client = ep.Addr
+				if f.token == "" {
+					f.token = ep.Token
+				}
+				if f.pass == "" {
+					f.pass = ep.Pass
+				}
+				if f.cloak == "" {
+					f.cloak = ep.Cloak
+				}
+			}
+		}
+	}
 	ctx := signalContext()
 	return runClient(ctx, f)
+}
+
+// loadConfigQuiet loads the config without warnings (missing file is fine).
+func loadConfigQuiet() *Config {
+	path := os.Getenv("BOTJIM_CONFIG")
+	if path == "" {
+		path = ConfigPath()
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		return &Config{}
+	}
+	return cfg
 }
 
 func summaryFor(pull bool) string {
@@ -223,6 +257,11 @@ func runClient(ctx context.Context, f *flags) int {
 	fmt.Fprintln(os.Stderr)
 	if logPath != "" {
 		fmt.Fprintf(os.Stderr, "transfer log: %s\n", logPath)
+	}
+	if f.receipt != "" {
+		if p := writeReceipt(f.receipt, addr, f.pull, res); p != "" {
+			fmt.Fprintf(os.Stderr, "receipt: %s\n", p)
+		}
 	}
 	for _, fe := range rep.Errors {
 		fmt.Fprintf(os.Stderr, "  error: %s: %s\n", fe.Path, fe.Msg)

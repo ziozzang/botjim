@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -37,6 +39,8 @@ func cmdSwarm(args []string) int {
 		return swarmTrack(rest)
 	case "verify":
 		return swarmVerify(rest)
+	case "keygen":
+		return swarmKeygen(rest)
 	case "--help", "-h", "help":
 		swarmUsage()
 		return 0
@@ -53,6 +57,7 @@ func swarmUsage() {
   botjim swarm join  [flags] --code CODE      assemble from the swarm into --dest
   botjim swarm track [flags]                  run the tracker (room membership)
   botjim swarm verify PATH                    re-hash and print the swarm ID
+  botjim swarm keygen [flags]                 create the ed25519 spec-signing key
 
 The token authenticates the tracker room AND encrypts every peer link;
 share it out-of-band along with the tracker address. The artifact's
@@ -68,6 +73,7 @@ func swarmSeed(args []string) int {
 		token   string
 		port    int
 		name    string
+		keyPath string
 	)
 	fs := newFlagSet("swarm seed", "botjim swarm seed [flags] PATH...",
 		"Hash PATH into a swarm spec, serve chunks, announce to the tracker.\nPrints the swarm ID and writes <name>.swarm.json beside the data.")
@@ -75,6 +81,7 @@ func swarmSeed(args []string) int {
 	fs.StringVar(&token, "code", "", "swarm token (generated when omitted; required for joins)")
 	fs.IntVar(&port, "p", 0, "port to serve chunks on (0 = ephemeral; peers need to reach it)")
 	fs.StringVar(&name, "name", "", "artifact name for the descriptor (default: first path's base)")
+	fs.StringVar(&keyPath, "key", "", "sign the descriptor with this ed25519 key\n(default ~/.botjim/keys/swarm-ed25519 when it exists;\ncreated fresh by 'botjim swarm keygen')")
 	if err := fs.Parse(args); err != nil {
 		if parseHelp(err) {
 			return 0
@@ -102,6 +109,25 @@ func swarmSeed(args []string) int {
 		return 2
 	}
 	desc := relay.SwarmManifestFrom(spec, tracker)
+	if keyPath == "" {
+		keyPath = relay.DefaultSwarmKeyPath() // sign silently only if it exists
+	}
+	if _, err := os.Stat(keyPath); err == nil {
+		priv, kerr := relay.LoadSwarmKey(keyPath)
+		if kerr != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", kerr)
+			return 2
+		}
+		desc.Sign(priv)
+	} else if flagPresent(args, "key") {
+		// --key explicitly pointed somewhere: create it rather than ship unsigned
+		priv, kerr := relay.GenerateSwarmKey(keyPath)
+		if kerr != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", kerr)
+			return 2
+		}
+		desc.Sign(priv)
+	}
 	descPath, err := relay.WriteSwarmManifest(filepath.Dir(roots[0]), name, desc)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -111,6 +137,10 @@ func swarmSeed(args []string) int {
 	fmt.Fprintf(os.Stderr, "files:   %d (%s)\n", len(spec.Files), humanBytes(uint64(spec.TotalBytes())))
 	fmt.Fprintf(os.Stderr, "code:    %s\n", relay.FormatCode(token))
 	fmt.Fprintf(os.Stderr, "spec:    %s\n", descPath)
+	if desc.Signed() {
+		fmt.Fprintf(os.Stderr, "signed:  %s…\n", desc.PubKey[:24])
+		fmt.Fprintln(os.Stderr, "         (joiners pin it with --verify-key)")
+	}
 
 	// serve chunks (root = the common ancestor of the paths)
 	root := filepath.Dir(roots[0])
@@ -156,12 +186,13 @@ func announceLoop(ctx context.Context, tracker, token string, spec *relay.SwarmS
 
 func swarmJoin(args []string) int {
 	var (
-		tracker string
-		token   string
-		spec    string
-		dest    string
-		par     int
-		serve   string
+		tracker   string
+		token     string
+		spec      string
+		dest      string
+		par       int
+		serve     string
+		verifyKey string
 	)
 	fs := newFlagSet("swarm join", "botjim swarm join [flags] --code CODE",
 		"Assemble the artifact into --dest: fetch missing chunks from any\npeer (seed or other joiners), verify each file, resume on re-run.")
@@ -171,6 +202,7 @@ func swarmJoin(args []string) int {
 	fs.StringVar(&dest, "dest", ".", "directory to assemble into")
 	fs.IntVar(&par, "parallel", 4, "concurrent chunk fetches")
 	fs.StringVar(&serve, "serve", ":0", "also serve verified chunks to other joiners\n(the mesh ramp: peers on your LAN fetch from you; \"\" disables)")
+	fs.StringVar(&verifyKey, "verify-key", "", "require a valid ed25519 signature by this public key\n(hex, printed by 'swarm seed'/'swarm keygen') on the spec")
 	if err := fs.Parse(args); err != nil {
 		if parseHelp(err) {
 			return 0
@@ -194,6 +226,13 @@ func swarmJoin(args []string) int {
 	if err := json.Unmarshal(b, &desc); err != nil {
 		fmt.Fprintln(os.Stderr, "error: bad spec:", err)
 		return 3
+	}
+	if err := desc.Verify(verifyKey); err != nil {
+		fmt.Fprintln(os.Stderr, "error: spec signature:", err)
+		return 2
+	}
+	if desc.Signed() && verifyKey == "" {
+		fmt.Fprintf(os.Stderr, "note: spec is signed by %s… (pin it with --verify-key for closed-loop trust)\n", desc.PubKey[:16])
 	}
 	// the descriptor embeds every file's size and hash — the joiner
 	// needs nothing beside it
@@ -273,5 +312,40 @@ func swarmVerify(args []string) int {
 		fmt.Printf("%s  %10s  %s\n", f.SHA[:16], humanBytes(uint64(f.Size)), f.Path)
 	}
 	fmt.Printf("swarm id: %s\n", spec.SpecHash())
+	return 0
+}
+
+// ---- keygen ----
+
+// swarmKeygen creates (or reprints) the ed25519 key that signs swarm
+// descriptors; the public half is what joiners pass as --verify-key.
+func swarmKeygen(args []string) int {
+	var keyPath string
+	fs := newFlagSet("swarm keygen", "botjim swarm keygen [--key PATH]",
+		"Create the ed25519 spec-signing key and print its public half.\n'swarm seed' signs automatically when this key exists.")
+	fs.StringVar(&keyPath, "key", relay.DefaultSwarmKeyPath(), "key path")
+	if err := fs.Parse(args); err != nil {
+		if parseHelp(err) {
+			return 0
+		}
+		return 3
+	}
+	if _, err := os.Stat(keyPath); err == nil {
+		priv, err := relay.LoadSwarmKey(keyPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			return 2
+		}
+		pub, _ := priv.Public().(ed25519.PublicKey)
+		fmt.Printf("key exists: %s\npublic key: %s\n", keyPath, hex.EncodeToString(pub))
+		return 0
+	}
+	priv, err := relay.GenerateSwarmKey(keyPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 2
+	}
+	pub, _ := priv.Public().(ed25519.PublicKey)
+	fmt.Printf("created:   %s\npublic key: %s\nshare the public key with joiners (--verify-key)\n", keyPath, hex.EncodeToString(pub))
 	return 0
 }

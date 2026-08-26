@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -248,6 +250,20 @@ func matchSegs(p, n []string, isDir bool) (bool, error) {
 		return false, err
 	}
 	return matchSegs(p[1:], n[1:], isDir)
+}
+
+// FreeBytes reports free space at the filesystem holding path (0 when
+// unknown — callers treat it as "cannot judge").
+func FreeBytes(path string) int64 {
+	var st unix.Statfs_t
+	if err := unix.Statfs(path, &st); err != nil {
+		return 0
+	}
+	avail := st.Bavail * uint64(st.Bsize)
+	if avail > 1<<62 {
+		return 0 // implausible on 32-bit bsize overflow
+	}
+	return int64(avail)
 }
 
 // FileExists reports a plain existence probe by Lstat.

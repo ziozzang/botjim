@@ -190,6 +190,8 @@ type SwarmManifest struct {
 	FileEntries []SwarmFile `json:"file_entries"` // sizes+hashes: joiners need no local data
 	TotalBytes  int64       `json:"total_bytes"`
 	Tracker     string      `json:"tracker,omitempty"`
+	PubKey      string      `json:"pubkey,omitempty"` // signer's ed25519 public key (hex)
+	Sig         string      `json:"sig,omitempty"`    // ed25519 signature over the unsigned body
 }
 
 // WriteSwarmManifest serializes the descriptor to dir/<name>.swarm.json.

@@ -498,6 +498,15 @@ func (r *Receiver) prepareRegular(ctx context.Context, e manifest.Entry) {
 		return
 	}
 
+	// disk-space guard: refuse a file that cannot fit (the transfer's
+	// other files continue; failing fast beats a 97%-then-ENOSPC run)
+	if grid.Count() > 0 {
+		if free := fsutil.FreeBytes(r.root); free > 0 && e.Size > free {
+			r.failEntry(e, CodeNoSpace, fmt.Sprintf("need %d bytes, %d free", e.Size, free))
+			return
+		}
+	}
+
 	// empty file: nothing streams, finalize inline
 	if grid.Count() == 0 {
 		r.writeEmpty(abs, e)

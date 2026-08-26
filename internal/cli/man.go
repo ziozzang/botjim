@@ -50,6 +50,20 @@ func cmdMan(args []string) int {
 			sb.WriteString("Print the config file location.\n")
 		case "config show":
 			sb.WriteString("Print the loaded config.\n")
+		case "endpoints":
+			sb.WriteString("List named endpoints from the config.\n")
+		case "sync push":
+			sb.WriteString("Mirror a directory to a named endpoint (its autosync policy).\n")
+		case "sync pull":
+			sb.WriteString("Mirror a named endpoint's root into a local directory.\n")
+		case "peers":
+			sb.WriteString("Discover botjim servers on the LAN (servers started with --discover).\n")
+		case "pipe send":
+			sb.WriteString("Stream stdin to a remote file (tar | netcat drop-in, engine-backed).\n")
+		case "pipe cat":
+			sb.WriteString("Stream one remote file to stdout.\n")
+		case "swarm keygen":
+			sb.WriteString("Create the ed25519 spec-signing key and print its public half.\n")
 		}
 	}
 	sb.WriteString(".SH SECURITY\nDirect mode is plaintext unless --pass is set on both sides (X25519 + ChaCha20\\-Poly1305 record layer). --token requires a shared secret. Relay and swarm links are end\\-to\\-end encrypted by construction; the broker and tracker see only ciphertext and metadata.\n")

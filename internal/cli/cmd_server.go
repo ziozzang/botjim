@@ -3,11 +3,13 @@ package cli
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/ziozzang/botjim/internal/attrs"
+	"github.com/ziozzang/botjim/internal/discover"
 	"github.com/ziozzang/botjim/internal/fsutil"
 	"github.com/ziozzang/botjim/internal/session"
 	"github.com/ziozzang/botjim/internal/transport"
@@ -29,6 +31,7 @@ func cmdServer(args []string) int {
 	fs.BoolVar(&f.noFsync, "no-fsync", false, "skip fsync before finalize")
 	fs.StringVar(&f.token, "token", "", "require this shared-secret token from clients")
 	fs.StringVar(&f.pass, "pass", "", "require record-layer encryption with this passphrase\n(clients must use the same --pass)")
+	fs.BoolVar(&f.discover, "discover", false, "announce this server on the LAN multicast group\n('botjim peers' lists it; opt-in — reveals name/addr/root/version)")
 	addCommonFlags(fs, f)
 	if err := fs.Parse(args); err != nil {
 		if parseHelp(err) {
@@ -90,6 +93,18 @@ func runServer(ctx context.Context, f *flags, owners attrs.OwnerPolicy) error {
 		Cloak:       f.cloak,
 	})
 	fmt.Fprintf(os.Stderr, "botjim %s serving %s on %s (plain V1 — use on trusted networks)\n", version.Version, root, bind)
+	if f.discover {
+		advPort := f.port
+		if ta, ok := ln.Addr().(*net.TCPAddr); ok && ta.Port > 0 {
+			advPort = ta.Port
+		}
+		host, _ := os.Hostname()
+		if host == "" {
+			host = "botjim"
+		}
+		go discover.Announce(ctx, discover.Beacon{Name: host, Port: advPort, Root: root, Ver: version.Version}, 3*time.Second)
+		fmt.Fprintf(os.Stderr, "announcing on the LAN: botjim peers\n")
+	}
 
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve(ln) }()

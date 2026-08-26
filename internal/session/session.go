@@ -408,9 +408,10 @@ type ClientConfig struct {
 
 // ClientResult is what a client run produced.
 type ClientResult struct {
-	Report engine.Report
-	Plan   []engine.PlanRow // dry-run rows (Populated with --dry-run)
-	Err    error
+	Report         engine.Report
+	Plan           []engine.PlanRow // dry-run rows (Populated with --dry-run)
+	ManifestDigest string           // SHA-256 over the sent manifest (receipts)
+	Err            error
 }
 
 // RunTransfer dials, negotiates and runs one transfer with a fresh registry.
@@ -548,7 +549,8 @@ func RunWithProgress(ctx context.Context, cfg ClientConfig, reg *progress.Regist
 	if cfg.Direction == protocol.DirPush {
 		sender := engine.NewSender(sess, ctrl, opts, reg, cfg.Paths)
 		report, err := sender.Run(ctx)
-		return ClientResult{Report: report, Plan: sender.Plan(), Err: err}
+		digest, _ := sender.ManifestDigest()
+		return ClientResult{Report: report, Plan: sender.Plan(), ManifestDigest: digest, Err: err}
 	}
 
 	if err := os.MkdirAll(cfg.DestRoot, 0o755); err != nil {

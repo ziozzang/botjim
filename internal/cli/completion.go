@@ -8,7 +8,7 @@ import (
 
 // The command table completions are generated from.
 var completionCommands = []struct{ name, opts string }{
-	{"server", "--bind --root --port --map-owners --parallel --no-fsync --no-tui --token --pass --cloak -q -v --log-file --audit --audit-file"},
+	{"server", "--bind --root --port --map-owners --parallel --no-fsync --no-tui --token --pass --cloak --discover -q -v --log-file --audit --audit-file"},
 	{"send", "--via --code --port --dest --compress --zstd-level --parallel --map-owners --no-xattr --no-sparse --devices --one-file-system --resume --no-fsync --stop-on-error --probe --token --pass --cloak --limit --retries --dry-run --exclude --include --json --delete --no-tui -q -v --log-file --audit --audit-file"},
 	{"pull", "--port --dest --compress --zstd-level --parallel --map-owners --no-xattr --no-sparse --devices --one-file-system --resume --no-fsync --stop-on-error --probe --token --pass --cloak --limit --retries --dry-run --exclude --include --json --delete --no-tui -q -v --log-file --audit --audit-file"},
 	{"relay", "--bind --port --wait --spool-max --spool-mem --spool-dir --no-spool-disk"},
@@ -17,12 +17,19 @@ var completionCommands = []struct{ name, opts string }{
 	{"swarm join", "--tracker --code --spec --dest --parallel --serve"},
 	{"swarm track", "--port"},
 	{"swarm verify", ""},
+	{"swarm keygen", "--key"},
+	{"sync push", "--dir"},
+	{"sync pull", "--dest"},
+	{"peers", "--wait --json"},
 	{"serve", "--bind --port --root"},
 	{"update", "--check --force --version --repo"},
 	{"audit verify", ""},
 	{"audit tail", ""},
 	{"config path", ""},
 	{"config show", ""},
+	{"endpoints", ""},
+	{"pipe send", "--stdin --name"},
+	{"pipe cat", ""},
 	{"version", ""},
 	{"help", ""},
 }

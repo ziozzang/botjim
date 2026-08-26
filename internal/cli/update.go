@@ -15,6 +15,8 @@ import (
 
 	"github.com/ziozzang/botjim/internal/selfupdate"
 	"github.com/ziozzang/botjim/internal/version"
+
+	"github.com/charmbracelet/x/term"
 )
 
 // updateCmd implements `botjim update`.
@@ -210,9 +212,7 @@ func writeUpdateCache(path string, c updateCache) {
 }
 
 func stderrIsTerminal() bool {
-	fi, err := os.Stderr.Stat()
-	if err != nil {
-		return false
-	}
-	return fi.Mode()&os.ModeCharDevice != 0
+	// ioctl-based check: a Stat() ModeCharDevice test would classify
+	// /dev/null as a terminal and launch the TUI on redirected runs
+	return term.IsTerminal(os.Stderr.Fd())
 }

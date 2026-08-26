@@ -33,6 +33,26 @@ type Config struct {
 	NoTUI     bool     `json:"no_tui"`
 	SpoolMax  string   `json:"spool_max"`
 	SpoolMem  string   `json:"spool_mem"`
+	// named endpoints: send/pull take a name instead of HOST[:port]
+	Endpoints map[string]Endpoint `json:"endpoints"`
+	// per-target autosync policies (sync push/pull)
+	Autosync map[string]SyncTarget `json:"autosync"`
+}
+
+// Endpoint is one named remote.
+type Endpoint struct {
+	Addr  string `json:"addr"` // host[:port]
+	Token string `json:"token,omitempty"`
+	Pass  string `json:"pass,omitempty"`
+	Cloak string `json:"cloak,omitempty"`
+}
+
+// SyncTarget is the sync policy for one endpoint.
+type SyncTarget struct {
+	Include []string `json:"include,omitempty"`
+	Exclude []string `json:"exclude,omitempty"`
+	Dest    string   `json:"dest,omitempty"`   // pull: receive dir
+	Delete  bool     `json:"delete,omitempty"` // mirror semantics
 }
 
 // ConfigPath is the config file location (~/.botjim/config.json).
@@ -78,6 +98,15 @@ func flagPresent(args []string, names ...string) bool {
 }
 
 // apply fills flag values the user did not pass from the config file.
+// ResolveEndpoint returns the endpoint stored under name, if any.
+func (c *Config) ResolveEndpoint(name string) (Endpoint, bool) {
+	if c.Endpoints == nil {
+		return Endpoint{}, false
+	}
+	e, ok := c.Endpoints[name]
+	return e, ok
+}
+
 func (c *Config) apply(f *flags, args []string) {
 	if c.Port != "" && !flagPresent(args, "p", "port") {
 		if v, err := parseSizeInt(c.Port); err == nil {

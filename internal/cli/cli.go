@@ -68,11 +68,13 @@ type flags struct {
 	audit     bool
 	auditFile string
 	cloak     string
+	receipt   string
 	jsonOut   bool
 	deleteDst bool
 	exclude   []string // walker exclusions
 	include   []string // walker inclusions (when set, only these)
 	dryRun    bool
+	discover  bool // server: announce on the LAN multicast group
 }
 
 // stringList is a repeatable string flag (--exclude a --exclude b).
@@ -105,6 +107,7 @@ func addCommonFlags(fs *flag.FlagSet, f *flags) {
 	fs.BoolVar(&f.verbose, "v", false, "verbose")
 	fs.StringVar(&f.logFile, "log-file", "", "append the transfer log to this file\n(default ~/.cache/botjim/transfers.log)")
 	fs.BoolVar(&f.audit, "audit", false, "record a tamper-evident hash-chained audit journal")
+	fs.StringVar(&f.receipt, "receipt", "", "write a transfer receipt (JSON) to this path after the run\n(default ~/.cache/botjim/receipts/<ts>.json with --receipt)")
 	fs.BoolVar(&f.jsonOut, "json", false, "emit NDJSON transfer events on stdout (for scripts/CI)")
 	fs.BoolVar(&f.deleteDst, "delete", false, "mirror: delete destination files missing from the manifest (jail-scoped)")
 	fs.StringVar(&f.cloak, "cloak", "", "disguise the session as HTTP/websocket traffic on this path\n(e.g. /cdn/data; both sides need the same path)")
@@ -146,6 +149,14 @@ func Main(args []string) int {
 		return cmdAudit(args[1:])
 	case "config":
 		return cmdConfig(args[1:])
+	case "endpoints":
+		return cmdEndpoints(args[1:])
+	case "peers":
+		return cmdPeers(args[1:])
+	case "pipe":
+		return cmdPipe(args[1:])
+	case "sync":
+		return cmdSync(args[1:])
 	case "serve":
 		return cmdServe(args[1:])
 	case "completion":
@@ -201,6 +212,11 @@ usage:
   botjim swarm seed/join/track/verify         token-joined swarm distribution
   botjim audit verify|tail FILE               hash-chain journal reader
   botjim config path|show                     ~/.botjim/config.json defaults
+  botjim endpoints                            list named endpoints
+  botjim sync push|pull NAME                   mirror with per-target policy
+  botjim pipe send --stdin NAME HOST          stdin → remote (tar |nc drop-in)
+  botjim pipe cat HOST PATH                    remote file → stdout
+  botjim peers                               discover botjim servers on the LAN
   botjim serve [DIR]                          HTTP+Range bridge for any downloader
   botjim completion bash|zsh|fish             shell completions
   botjim man                                  botjim(1) roff page
