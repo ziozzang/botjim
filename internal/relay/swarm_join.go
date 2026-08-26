@@ -16,6 +16,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/ziozzang/botjim/internal/chunking"
 )
 
@@ -46,13 +48,83 @@ type Joiner struct {
 	// from the v2 catalog is the integrity check.
 	HTTPBase string
 
+	// Stay keeps the node serving after the download completes (a seed).
+	// Without it the joiner exits when done (one-shot pull).
+	Stay bool
+
 	mu       sync.Mutex
 	rr       atomic.Int64        // round-robin cursor for peer rotation
 	curPeers []Peer              // live member list, refreshed by re-announce
 	parts    map[string]*os.File // rel path → part fd (lazy init)
 	verified map[string]bool     // rel path → passed whole-file SHA
+	avail    map[string][]bool   // rel path → per-chunk verified-and-serveable
 	banned   map[string]bool     // peer addr → served a bad chunk
 	serveLn  net.Listener
+}
+
+// markAvail records that chunk ci of file rel is written and verified, so
+// the serve path may hand it to other peers (the mesh ramp).
+func (j *Joiner) markAvail(rel string, ci int64, count int64) {
+	j.mu.Lock()
+	if j.avail == nil {
+		j.avail = map[string][]bool{}
+	}
+	bm := j.avail[rel]
+	if int64(len(bm)) != count {
+		nb := make([]bool, count)
+		copy(nb, bm)
+		bm = nb
+		j.avail[rel] = bm
+	}
+	if ci >= 0 && ci < count {
+		bm[ci] = true
+	}
+	j.mu.Unlock()
+}
+
+// ReadPiece implements PieceSource: serve a chunk this joiner holds, from
+// the finalized file if done, else from the still-open part file. Only
+// chunks whose bytes were written AND verified (markAvail) are offered.
+func (j *Joiner) ReadPiece(fileIdx, chunkIdx int64, buf []byte) (int, bool) {
+	if fileIdx < 0 || fileIdx >= int64(len(j.Spec.Files)) {
+		return 0, false
+	}
+	f := j.Spec.Files[fileIdx]
+	grid := chunking.Grid{Size: f.Size, ChunkSize: chunking.ChunkSizeFor(f.Size)}
+	n := grid.Len(chunkIdx)
+	j.mu.Lock()
+	final := j.verified[f.Path]
+	var haveBit bool
+	if bm := j.avail[f.Path]; chunkIdx >= 0 && chunkIdx < int64(len(bm)) {
+		haveBit = bm[chunkIdx]
+	}
+	pf := j.parts[f.Path]
+	j.mu.Unlock()
+	if !final && !haveBit {
+		return 0, false
+	}
+	// finalized file: read from its final path
+	if final {
+		abs := filepath.Join(j.Dest, f.Path)
+		if got, err := readChunkAt(abs, buf[:n], grid.Offset(chunkIdx)); err == nil && int64(got) == n {
+			return int(n), true
+		}
+		return 0, false
+	}
+	// in-progress: read from the open part fd (ReadAt is positional and
+	// safe for concurrent readers on a shared *os.File)
+	if pf != nil {
+		if got, err := pf.ReadAt(buf[:n], grid.Offset(chunkIdx)); err == nil && int64(got) == n {
+			return int(n), true
+		}
+	}
+	// the part may have just been renamed to final (finalize race): retry
+	// the final path once — same immutable bytes either way
+	abs := filepath.Join(j.Dest, f.Path)
+	if got, err := readChunkAt(abs, buf[:n], grid.Offset(chunkIdx)); err == nil && int64(got) == n {
+		return int(n), true
+	}
+	return 0, false
 }
 
 func (j *Joiner) setPeers(p []Peer) {
@@ -124,6 +196,18 @@ func (j *Joiner) Run(ctx context.Context) error {
 	if err := os.MkdirAll(j.Dest, 0o755); err != nil {
 		return err
 	}
+	// exclusive lock on the dest: two swarm joins into the same directory
+	// would corrupt each other's part files (and, with serving, hand out
+	// half-written chunks). Refuse the second.
+	lf, err := os.OpenFile(filepath.Join(j.Dest, ".botjim-swarm.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := unix.Flock(int(lf.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		lf.Close()
+		return fmt.Errorf("another swarm join is already writing to %s", j.Dest)
+	}
+	defer lf.Close() // lock held for the whole run (incl. --seed serving)
 	if j.parts == nil {
 		j.parts = map[string]*os.File{}
 	}
@@ -136,6 +220,24 @@ func (j *Joiner) Run(ctx context.Context) error {
 			return err
 		}
 	}
+	// build the chunk task list FIRST (scan local/resumed parts), seeding
+	// the availability map, so the initial announce already advertises any
+	// pieces we can serve
+	var tasks []chunkTask
+	var total, done int64
+	for fi, f := range j.Spec.Files {
+		grid := chunking.Grid{Size: f.Size, ChunkSize: chunking.ChunkSizeFor(f.Size)}
+		total += f.Size
+		have := j.localChunks(f, grid)
+		for ci := int64(0); ci < grid.Count(); ci++ {
+			if !have[ci] {
+				tasks = append(tasks, chunkTask{file: int64(fi), chunk: ci})
+			} else {
+				j.markAvail(f.Path, ci, grid.Count()) // resumed piece: serveable
+			}
+		}
+	}
+
 	// initial announce: a cold-start race (joiner announces before the
 	// seed's first announce lands) must not be fatal — retry a few cycles
 	var peers []Peer
@@ -159,21 +261,8 @@ func (j *Joiner) Run(ctx context.Context) error {
 	// captured peer list never grows
 	go j.reannounceLoop(ctx)
 
-	// build the chunk task list: (fileIdx, chunkIdx) for everything the
-	// local catalog does not hold, then order rarest-first (fewest peers
-	// hold it → fetch early so it propagates widest)
-	var tasks []chunkTask
-	var total, done int64
-	for fi, f := range j.Spec.Files {
-		grid := chunking.Grid{Size: f.Size, ChunkSize: chunking.ChunkSizeFor(f.Size)}
-		total += f.Size
-		have := j.localChunks(f, grid)
-		for ci := int64(0); ci < grid.Count(); ci++ {
-			if !have[ci] {
-				tasks = append(tasks, chunkTask{file: int64(fi), chunk: ci})
-			}
-		}
-	}
+	// order rarest-first (fewest peers hold it → fetch early so it
+	// propagates widest)
 	tasks = orderRarestFirst(tasks, j.Spec, peers)
 	if j.OnProgress != nil {
 		j.OnProgress(0, total)
@@ -236,6 +325,15 @@ func (j *Joiner) Run(ctx context.Context) error {
 		if err := j.finalize(f); err != nil {
 			return err
 		}
+	}
+	// seed mode: stay up and keep serving the finished artifact to the
+	// swarm until cancelled (torrent-style seeding). reannounceLoop keeps
+	// our now-complete catalog fresh at the tracker.
+	if j.Stay && j.ServeAddr != "" {
+		if j.OnProgress != nil {
+			j.OnProgress(total, total)
+		}
+		<-ctx.Done()
 	}
 	return nil
 }
@@ -417,8 +515,13 @@ func (j *Joiner) writeChunk(f SwarmFile, grid chunking.Grid, ci int64, data []by
 		j.parts[f.Path] = pf
 	}
 	j.mu.Unlock()
-	_, err := pf.WriteAt(data, grid.Offset(ci))
-	return err
+	if _, err := pf.WriteAt(data, grid.Offset(ci)); err != nil {
+		return err
+	}
+	// the chunk was verified before writeChunk (fetchWithRetry → chunkOK)
+	// and is now on disk: advertise it so peers can fetch it from us
+	j.markAvail(f.Path, ci, grid.Count())
+	return nil
 }
 
 // finalize closes the part, verifies the whole-file hash against the
@@ -482,7 +585,7 @@ func (j *Joiner) startServing(ctx context.Context) error {
 		<-ctx.Done()
 		_ = ln.Close()
 	}()
-	go func() { _ = ServePeer(ctx, ln, j.Spec, j.Dest, j.Token) }()
+	go func() { _ = ServePeer(ctx, ln, j.Spec, j, j.Token) }()
 	return nil
 }
 
@@ -533,13 +636,25 @@ func orderRarestFirst(tasks []chunkTask, spec *SwarmSpec, peers []Peer) []chunkT
 // (one concatenated hex per file, '/'-separated).
 func (j *Joiner) catalog() string {
 	var parts []string
+	j.mu.Lock()
+	defer j.mu.Unlock()
 	for _, f := range j.Spec.Files {
 		grid := chunking.Grid{Size: f.Size, ChunkSize: chunking.ChunkSizeFor(f.Size)}
-		have := j.localChunks(f, grid)
-		bm := make([]byte, (len(have)+7)/8)
-		for i, h := range have {
-			if h {
+		count := grid.Count()
+		bm := make([]byte, (count+7)/8)
+		// serialize the in-memory availability map (populated by writeChunk
+		// and the startup resume scan) instead of re-hashing the whole part
+		// file from disk every 15s — for a 100GB artifact that re-read was
+		// crippling. A finalized file counts as fully available.
+		if j.verified[f.Path] {
+			for i := int64(0); i < count; i++ {
 				bm[i/8] |= 1 << (uint(i) % 8)
+			}
+		} else if avail := j.avail[f.Path]; avail != nil {
+			for i := int64(0); i < count && i < int64(len(avail)); i++ {
+				if avail[i] {
+					bm[i/8] |= 1 << (uint(i) % 8)
+				}
 			}
 		}
 		parts = append(parts, catalogHex(bm))

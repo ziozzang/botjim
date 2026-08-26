@@ -48,7 +48,8 @@ type Sidecar struct {
 	FullyWritten bool      `json:"fullyWritten"`
 	Updated      time.Time `json:"updated"`
 
-	have []byte `json:"-"`
+	have      []byte `json:"-"`
+	haveCount int64  `json:"-"` // cached popcount of have; keeps Complete() O(1)
 }
 
 // Spec is a JSON-friendly manifest.Timespec.
@@ -93,6 +94,9 @@ func (s *Sidecar) SetHave(i int64, h [32]byte, zero bool) {
 	} else {
 		s.Hashes[i] = hex.EncodeToString(h[:])
 	}
+	if s.have[i/8]&(1<<(uint(i)%8)) == 0 {
+		s.haveCount++
+	}
 	s.have[i/8] |= 1 << (uint(i) % 8)
 }
 
@@ -102,18 +106,25 @@ func (s *Sidecar) ClearHave(i int64) {
 		return
 	}
 	s.Hashes[i] = ""
+	if s.have[i/8]&(1<<(uint(i)%8)) != 0 {
+		s.haveCount--
+	}
 	s.have[i/8] &^= 1 << (uint(i) % 8)
 }
 
-// HaveCount counts verified chunks.
-func (s *Sidecar) HaveCount() int64 {
+// HaveCount returns the number of verified chunks (cached; O(1)).
+func (s *Sidecar) HaveCount() int64 { return s.haveCount }
+
+// recountHave rebuilds the cached popcount from the bitmap — called after
+// any wholesale bitmap replacement (Load, AdoptBitmap).
+func (s *Sidecar) recountHave() {
 	n := int64(0)
 	for i := int64(0); i < s.ChunkCount; i++ {
-		if s.Have(i) {
+		if s.have[i/8]&(1<<(uint(i)%8)) != 0 {
 			n++
 		}
 	}
-	return n
+	s.haveCount = n
 }
 
 // Complete reports whether every chunk is marked present.
@@ -130,6 +141,7 @@ func (s *Sidecar) Bitmap() []byte {
 func (s *Sidecar) AdoptBitmap(b []byte) {
 	s.have = make([]byte, len(b))
 	copy(s.have, b)
+	s.recountHave()
 }
 
 // ResizeHave fixes up the in-memory bitmap after Load.
@@ -140,6 +152,7 @@ func (s *Sidecar) ResizeHave() {
 		copy(fixed, s.have)
 		s.have = fixed
 	}
+	s.recountHave()
 }
 
 // Validate checks the sidecar against a manifest entry. strictMtime compares

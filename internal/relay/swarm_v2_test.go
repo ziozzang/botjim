@@ -77,9 +77,9 @@ func TestSwarmLyingPeerBanned(t *testing.T) {
 
 	token := GenerateCode()
 	sln, _ := net.Listen("tcp", "127.0.0.1:0")
-	go func() { _ = ServePeer(context.Background(), sln, spec, seedDir, token) }()
+	go func() { _ = ServePeerRoot(context.Background(), sln, spec, seedDir, token) }()
 	lln, _ := net.Listen("tcp", "127.0.0.1:0")
-	go func() { _ = ServePeer(context.Background(), lln, spec, liarDir, token) }()
+	go func() { _ = ServePeerRoot(context.Background(), lln, spec, liarDir, token) }()
 
 	announceTo(context.Background(), tln.Addr().String(), token, spec.SpecHash(), sln.Addr().String(), "ff/ff", true)
 	announceTo(context.Background(), tln.Addr().String(), token, spec.SpecHash(), lln.Addr().String(), "ff/ff", false)

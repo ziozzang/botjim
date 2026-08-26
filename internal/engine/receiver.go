@@ -1147,17 +1147,16 @@ func (r *Receiver) finalize(id uint32) {
 		r.failFile(f, CodeIO, "close: "+err.Error())
 		return
 	}
-	// record completion (sidecar first: a crash between these steps is
-	// repaired by the next run's all-skip + prune), then swap into place
-	// and drop the sidecar and any stale siblings
+	// swap into place. We deliberately do NOT write the completion sidecar
+	// here: it would only cover a crash in the tiny window between now and
+	// the rename below, and that case is already safe — the part file
+	// survives and the next run re-hashes it (as an untrusted claim). For
+	// many-small-files this removes a JSON marshal + temp-write + rename +
+	// remove PER FILE. Any sidecar left from a resumed/interrupted run is
+	// still cleaned up just below.
 	f.mu.Lock()
 	f.sc.FullyWritten = true
-	serr := r.saveSidecar(f)
 	f.mu.Unlock()
-	if serr != nil {
-		r.failFile(f, CodeIO, "sidecar: "+serr.Error())
-		return
-	}
 	if f.partPath != f.abs { // delta adoption is already at the final path
 		if err := os.Rename(f.partPath, f.abs); err != nil {
 			r.failFile(f, CodeIO, "rename: "+err.Error())

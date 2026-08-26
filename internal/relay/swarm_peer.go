@@ -182,15 +182,56 @@ func hashFile(p string) (string, error) {
 
 const peerWire = "PEER1"
 
-// ServePeer answers GET requests from local files under root. One
-// connection at a time is fine; seeds are expected to be few.
-func ServePeer(ctx context.Context, ln net.Listener, spec *SwarmSpec, root, token string) error {
+// PieceSource supplies one chunk's bytes. ReadPiece returns (n, true) with
+// the chunk written into buf when this node holds it, or (0, false) for a
+// piece it does not have (→ MISS). A seed reads from its files; a joiner
+// reads verified pieces from its part files while still downloading — this
+// is what lets a joiner upload before it finishes (the mesh ramp).
+type PieceSource interface {
+	ReadPiece(fileIdx, chunkIdx int64, buf []byte) (int, bool)
+}
+
+// rootSource serves finalized files under a directory (the seed, and a
+// joiner's already-final files).
+type rootSource struct {
+	spec *SwarmSpec
+	root string
+}
+
+func (rs rootSource) ReadPiece(fileIdx, chunkIdx int64, buf []byte) (int, bool) {
+	f := rs.spec.Files[fileIdx]
+	grid := chunking.Grid{Size: f.Size, ChunkSize: chunking.ChunkSizeFor(f.Size)}
+	abs, err := fsutil.SafeJoin(rs.root, f.Path)
+	if err != nil {
+		return 0, false
+	}
+	n := grid.Len(chunkIdx)
+	got, err := readChunkAt(abs, buf[:n], grid.Offset(chunkIdx))
+	if err != nil || int64(got) != n {
+		return 0, false
+	}
+	return int(n), true
+}
+
+// ServePeer answers GET requests from a PieceSource. Concurrent
+// connections are bounded so a popular node is not connection-stormed.
+func ServePeer(ctx context.Context, ln net.Listener, spec *SwarmSpec, src PieceSource, token string) error {
+	sem := make(chan struct{}, maxServeConns)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return nil
 		}
+		select {
+		case sem <- struct{}{}:
+		default:
+			// at capacity: refuse fast so the fetcher re-routes to another
+			// peer instead of queueing (fetchWithRetry treats this as a miss)
+			_ = conn.Close()
+			continue
+		}
 		go func(c net.Conn) {
+			defer func() { <-sem }()
 			defer c.Close()
 			// every peer link is e2ee with the swarm token as PSK
 			wrapped, err := EncryptConn(c, []byte("botjim-swarm-psk/v1/"+NormalizeCode(token)), true)
@@ -198,13 +239,24 @@ func ServePeer(ctx context.Context, ln net.Listener, spec *SwarmSpec, root, toke
 				return
 			}
 			defer wrapped.Close()
-			servePeerConn(ctx, wrapped, spec, root)
+			servePeerConn(ctx, wrapped, spec, src)
 		}(conn)
 	}
 }
 
-func servePeerConn(ctx context.Context, c net.Conn, spec *SwarmSpec, root string) {
-	_ = c.SetDeadline(time.Now().Add(10 * time.Minute))
+// ServePeerRoot is the seed's serve loop: a PieceSource backed by files
+// under root (kept for the seeder and tests).
+func ServePeerRoot(ctx context.Context, ln net.Listener, spec *SwarmSpec, root, token string) error {
+	return ServePeer(ctx, ln, spec, rootSource{spec: spec, root: root}, token)
+}
+
+// maxServeConns bounds concurrent uploads per node.
+const maxServeConns = 32
+
+func servePeerConn(ctx context.Context, c net.Conn, spec *SwarmSpec, src PieceSource) {
+	// per-request deadline (extended each GET) rather than one absolute cap,
+	// so a long multi-chunk session on a slow link is not guillotined
+	_ = c.SetDeadline(time.Now().Add(2 * time.Minute))
 	line, err := readSwarmLine(c)
 	if err != nil || !strings.HasPrefix(line, peerWire+" ") {
 		fmt.Fprintf(c, "ERR protocol\n")
@@ -215,7 +267,9 @@ func servePeerConn(ctx context.Context, c net.Conn, spec *SwarmSpec, root string
 		return
 	}
 	fmt.Fprint(c, "OK\n")
+	var buf []byte
 	for {
+		_ = c.SetDeadline(time.Now().Add(2 * time.Minute))
 		line, err := readSwarmLine(c)
 		if err != nil {
 			return
@@ -235,20 +289,17 @@ func servePeerConn(ctx context.Context, c net.Conn, spec *SwarmSpec, root string
 			fmt.Fprint(c, "MISS\n")
 			continue
 		}
-		abs, err := fsutil.SafeJoin(root, f.Path)
-		if err != nil {
-			fmt.Fprint(c, "MISS\n")
-			continue
-		}
 		n := grid.Len(chunkIdx)
-		buf := make([]byte, n)
-		got, err := readChunkAt(abs, buf, grid.Offset(chunkIdx))
-		if err != nil || int64(got) != n {
+		if int64(cap(buf)) < n {
+			buf = make([]byte, grid.ChunkSize)
+		}
+		got, ok := src.ReadPiece(fileIdx, chunkIdx, buf[:n])
+		if !ok || int64(got) != n {
 			fmt.Fprint(c, "MISS\n")
 			continue
 		}
 		fmt.Fprintf(c, "%d\n", n)
-		if _, err := c.Write(buf); err != nil {
+		if _, err := c.Write(buf[:n]); err != nil {
 			return
 		}
 	}

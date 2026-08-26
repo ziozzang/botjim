@@ -192,9 +192,23 @@ portable descriptor (`.swarm.json`). The token does double duty: the
 tracker room is keyed by `SHA-256(token)` (the tracker never sees the
 token), and every peer↔peer link runs the e2ee record layer keyed from
 it — a peer without the token cannot even handshake. Joiners fetch
-chunks rarest-first from any peer (seed or joiner; joiners only serve
-files they have verified) or from static HTTP hosting (`--http`, one
-Range request per chunk), and resume on re-run.
+chunks rarest-first from any peer (seed or joiner) or from static HTTP
+hosting (`--http`, one Range request per chunk), and resume on re-run.
+
+**Mesh build-up (v0.12).** A joiner serves the pieces it holds *while
+still downloading*, not only after it finishes — the serve path is a
+`PieceSource` that reads a verified chunk from the still-open `.fs-part`
+file (falling back to the finalized file after the rename). Availability
+is an in-memory per-chunk bitmap set in `writeChunk` the moment a
+verified chunk lands, so `catalog()` re-announces what the node can serve
+every 15s without re-hashing the part file from disk. This is the
+difference between "N leechers on one seed" and a real mesh: pieces
+propagate peer-to-peer, so a swarm ramps to ~N·(seed rate). `--seed`
+keeps a finished node serving (torrent-style seeding) until Ctrl-C; a
+dest flock refuses a second `swarm join` into the same directory. Serve
+connections are capped (`maxServeConns`) so a popular node is not
+connection-stormed — at capacity it refuses fast and the fetcher
+re-routes to another peer.
 Descriptors can be **ed25519-signed** (`swarm keygen`); joiners pin the
 signer with `--verify-key` so a swapped or tampered spec fails closed.
 

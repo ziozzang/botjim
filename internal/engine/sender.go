@@ -70,6 +70,7 @@ type Sender struct {
 type chunkTask struct {
 	fileID uint32
 	idx    int64
+	f      *txFile // resolved file (nil for request-driven reqCh tasks)
 }
 
 type txFile struct {
@@ -733,7 +734,7 @@ func (s *Sender) retryChunk(m protocol.ChunkRetry) {
 	}
 	go func() {
 		select {
-		case s.taskCh <- chunkTask{fileID: m.FileID, idx: idx}:
+		case s.taskCh <- chunkTask{fileID: m.FileID, idx: idx, f: f}:
 		case <-s.ctrlDone:
 		}
 	}()
@@ -817,7 +818,7 @@ func (s *Sender) runScheduler(ctx context.Context) {
 					continue
 				}
 				select {
-				case s.taskCh <- chunkTask{fileID: f.entry.ID, idx: f.nextTask}:
+				case s.taskCh <- chunkTask{fileID: f.entry.ID, idx: f.nextTask, f: f}:
 					f.nextTask++
 					f.inflight++
 					progressed = true
@@ -909,7 +910,7 @@ func (s *Sender) runWorker(ctx context.Context, index uint64) error {
 		}
 		if err := s.sendChunk(ctx, ds, codec, task, &buf, &zbuf); err != nil {
 			if isCtxErr(err) {
-				s.taskDone(task.fileID)
+				s.taskDone(task)
 				_ = conn.Close()
 				return err
 			}
@@ -920,16 +921,20 @@ func (s *Sender) runWorker(ctx context.Context, index uint64) error {
 				s.failFile(f, CodeSourceChanged, err.Error())
 			}
 		}
-		s.taskDone(task.fileID)
+		s.taskDone(task)
 	}
 }
 
 // sendChunk reads, hashes, compresses and writes one chunk. The scheduler
 // already filtered have-bits; retries land here directly.
 func (s *Sender) sendChunk(ctx context.Context, ds *protocol.DataStream, codec compress.Codec, task chunkTask, bufp, zbufp *[]byte) error {
-	s.mu.Lock()
-	f := s.files[task.fileID]
-	s.mu.Unlock()
+	f := task.f
+	if f == nil {
+		// request-driven (reqCh) task: no pointer, resolve once
+		s.mu.Lock()
+		f = s.files[task.fileID]
+		s.mu.Unlock()
+	}
 	if f == nil || f.errored || f.resolved {
 		return nil
 	}
@@ -1017,9 +1022,12 @@ func isCtxErr(err error) bool {
 // a file rewritten mid-transfer yields chunks from mixed versions, which
 // each pass their own read but assemble into garbage — flag it instead of
 // reporting success.
-func (s *Sender) taskDone(fileID uint32) {
+func (s *Sender) taskDone(task chunkTask) {
+	f := task.f
 	s.mu.Lock()
-	f := s.files[fileID]
+	if f == nil {
+		f = s.files[task.fileID]
+	}
 	if f == nil {
 		s.mu.Unlock()
 		return

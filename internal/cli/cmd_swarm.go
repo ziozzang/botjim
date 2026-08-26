@@ -167,7 +167,7 @@ func swarmSeed(args []string) int {
 	if tracker != "" {
 		go announceLoop(ctx, tracker, token, spec, ln.Addr().String())
 	}
-	if err := relay.ServePeer(ctx, ln, spec, root, token); err != nil {
+	if err := relay.ServePeerRoot(ctx, ln, spec, root, token); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 2
 	}
@@ -201,6 +201,7 @@ func swarmJoin(args []string) int {
 		serve     string
 		verifyKey string
 		httpBase  string
+		seed      bool
 	)
 	fs := newFlagSet("swarm join", "botjim swarm join [flags] --code CODE",
 		"Assemble the artifact into --dest: fetch missing chunks from any\npeer (seed or other joiners), verify each file, resume on re-run.")
@@ -210,6 +211,7 @@ func swarmJoin(args []string) int {
 	fs.StringVar(&dest, "dest", ".", "directory to assemble into")
 	fs.IntVar(&par, "parallel", 4, "concurrent chunk fetches")
 	fs.StringVar(&serve, "serve", ":0", "also serve verified chunks to other joiners\n(the mesh ramp: peers on your LAN fetch from you; \"\" disables)")
+	fs.BoolVar(&seed, "seed", false, "after downloading, keep serving the artifact to the swarm\n(torrent-style seeding; Ctrl-C to stop)")
 	fs.StringVar(&verifyKey, "verify-key", "", "require a valid ed25519 signature by this public key\n(hex, printed by 'swarm seed'/'swarm keygen') on the spec")
 	fs.StringVar(&httpBase, "http", "", "also fetch chunks from this static HTTP base URL\n(Range requests; e.g. https://host/dl/ — file paths are appended)\nchunk SHA-256 from the spec is the integrity check")
 	if err := fs.Parse(args); err != nil {
@@ -267,6 +269,7 @@ func swarmJoin(args []string) int {
 		Parallel:    par,
 		ServeAddr:   serve,
 		HTTPBase:    httpBase,
+		Stay:        seed,
 		OnProgress: func(done, total int64) {
 			fmt.Fprintf(os.Stderr, "\r%6.1f%% %s/%s",
 				float64(done)/float64(total)*100, humanBytes(uint64(done)), humanBytes(uint64(total)))

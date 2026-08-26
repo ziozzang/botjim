@@ -42,6 +42,7 @@ type flags struct {
 	dest        string
 	pull        bool
 	compressA   string
+	fast        bool
 	zstdLvl     int
 	parallel    int
 	owners      string
@@ -121,6 +122,7 @@ func addTransferFlags(fs *flag.FlagSet, f *flags) {
 	fs.IntVar(&f.port, "p", DefaultPort, "port to connect to")
 	fs.StringVar(&f.dest, "dest", ".", "destination directory (pull)")
 	fs.StringVar(&f.compressA, "compress", "zstd", "compression: zstd | lz4 | none")
+	fs.BoolVar(&f.fast, "fast", false, "max throughput on a fast/trusted link: no compression\n(overrides --compress; use --pass for encryption)")
 	fs.IntVar(&f.zstdLvl, "zstd-level", 3, "zstd level 1(fastest)..4(best)")
 	fs.IntVar(&f.parallel, "parallel", 8, "parallel data streams (1..32)")
 	fs.StringVar(&f.owners, "map-owners", "none", "ownership: none | numeric | name")

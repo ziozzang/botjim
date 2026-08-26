@@ -145,6 +145,9 @@ func runClient(ctx context.Context, f *flags) int {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 3
 	}
+	if f.fast {
+		f.compressA = "none" // --fast: skip the compress attempt entirely
+	}
 	alg, err := algID(f.compressA)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)

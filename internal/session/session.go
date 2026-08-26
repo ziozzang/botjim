@@ -201,7 +201,8 @@ func (s *Server) handleConn(raw net.Conn) {
 		}
 		_ = raw.SetReadDeadline(time.Time{}) // AcceptSec sets its own
 	}
-	sess, err := transport.AcceptSec(raw, s.cfg.Features, nil, transport.SecOpts{Token: s.cfg.Token, Pass: s.cfg.Pass})
+	feats := secureFeatures(s.cfg.Features, s.cfg.Token, s.cfg.Pass)
+	sess, err := transport.AcceptSec(raw, feats, nil, transport.SecOpts{Token: s.cfg.Token, Pass: s.cfg.Pass})
 	if err != nil {
 		s.Log("%s handshake: %v", remote, err)
 		_ = raw.Close()
@@ -431,6 +432,19 @@ func (s *Server) serveList(ctrl *protocol.CtrlStream, payload []byte) {
 	_ = ctrl.Send(protocol.MsgListResp, 0, resp.Encode())
 }
 
+// secureFeatures drops the per-chunk checksum feature when the session is
+// AEAD-encrypted (--token/--pass v2): ChaCha20-Poly1305 already
+// authenticates every byte, so the crc32c trailer is pure redundant CPU
+// (~15% of a fast transfer). The handshake binding covers the feature
+// bits, so a MITM cannot re-enable it undetected. Plaintext sessions keep
+// it — there it is the only wire integrity check.
+func secureFeatures(base uint64, token, pass string) uint64 {
+	if token != "" || pass != "" {
+		return base &^ protocol.FeatChunkSum
+	}
+	return base
+}
+
 // ---- client side ----
 
 // ClientConfig configures one client run.
@@ -524,10 +538,11 @@ func RunWithProgress(ctx context.Context, cfg ClientConfig, reg *progress.Regist
 	var sess *transport.Session
 	var err error
 	sec := transport.SecOpts{Token: cfg.Token, Pass: cfg.Pass, Cloak: cfg.Cloak}
+	feats := secureFeatures(protocol.FeatAll, sec.Token, sec.Pass)
 	if cfg.Conn != nil {
-		sess, err = transport.DialConnSec(cfg.Conn, protocol.FeatAll, nil, sec)
+		sess, err = transport.DialConnSec(cfg.Conn, feats, nil, sec)
 	} else {
-		sess, err = transport.DialSec(ctx, cfg.Addr, protocol.FeatAll, nil, sec)
+		sess, err = transport.DialSec(ctx, cfg.Addr, feats, nil, sec)
 	}
 	if err != nil {
 		return ClientResult{Err: err}

@@ -48,7 +48,7 @@ func TestSwarmEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	token := GenerateCode()
-	go func() { _ = ServePeer(context.Background(), sln, spec, seedDir, token) }()
+	go func() { _ = ServePeerRoot(context.Background(), sln, spec, seedDir, token) }()
 	seedAddr := sln.Addr().String()
 	peers := announceTo(context.Background(), trackerAddr, token, spec.SpecHash(), seedAddr, "ff/ff", true)
 	_ = peers
@@ -146,7 +146,7 @@ func TestSwarmResumable(t *testing.T) {
 	spec, _ := BuildSwarmSpec(context.Background(), []string{seedDir}, "m")
 	sln, _ := net.Listen("tcp", "127.0.0.1:0")
 	token := GenerateCode()
-	go func() { _ = ServePeer(context.Background(), sln, spec, seedDir, token) }()
+	go func() { _ = ServePeerRoot(context.Background(), sln, spec, seedDir, token) }()
 	announceTo(context.Background(), tln.Addr().String(), token, spec.SpecHash(), sln.Addr().String(), "ff", true)
 
 	// partial: write half a part file manually, then join
@@ -207,7 +207,7 @@ func TestSwarmMeshTwoHops(t *testing.T) {
 
 	// joiner A: serves (ephemeral port)
 	lnA, _ := net.Listen("tcp", "127.0.0.1:0")
-	go func() { _ = ServePeer(context.Background(), lnA, spec, seedDir, token) }()
+	go func() { _ = ServePeerRoot(context.Background(), lnA, spec, seedDir, token) }()
 	announceTo(context.Background(), tln.Addr().String(), token, spec.SpecHash(), lnA.Addr().String(), "ff", true)
 
 	// joiner B pulls from the room (only A is there) and serves nothing
