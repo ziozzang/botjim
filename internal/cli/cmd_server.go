@@ -96,6 +96,7 @@ func runServer(ctx context.Context, f *flags, owners attrs.OwnerPolicy) error {
 		Token:       f.token,
 		Pass:        f.pass,
 		Cloak:       f.cloak,
+		NoSuid:      f.noSuid,
 	})
 	fmt.Fprintf(os.Stderr, "botjim %s serving %s on %s (plain V1 — use on trusted networks)\n", version.Version, root, bind)
 	if f.metricsAddr != "" {

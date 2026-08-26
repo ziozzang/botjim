@@ -82,7 +82,10 @@ func newZstd(level int) (Codec, error) {
 	}
 	dec, err := zstd.NewReader(nil,
 		zstd.WithDecoderConcurrency(1),
-		zstd.WithDecoderMaxMemory(256<<20),
+		// the codec only ever decodes ONE chunk at a time; the old 256MiB
+		// ceiling let a small streaming-format frame balloon ~16x before
+		// the post-decode length check, an OOM amplifier per worker
+		zstd.WithDecoderMaxMemory(18<<20),
 	)
 	if err != nil {
 		return nil, err

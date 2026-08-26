@@ -56,8 +56,14 @@ func NewGrid(size int64, chunkSize int64) Grid {
 
 // Count returns the number of chunks in the grid (0 for empty files).
 func (g Grid) Count() int64 {
-	if g.Size <= 0 {
+	// defensive: Grid is often built directly from wire-decoded fields
+	// (Entry.Grid bypasses NewGrid), so a crafted ChunkSize==0 must not
+	// divide-by-zero and a near-MaxInt64 Size must not overflow the numerator
+	if g.Size <= 0 || g.ChunkSize <= 0 {
 		return 0
+	}
+	if g.Size > (1 << 62) {
+		return 0 // absurd size: callers cap real files well below this
 	}
 	return (g.Size + g.ChunkSize - 1) / g.ChunkSize
 }

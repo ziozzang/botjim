@@ -51,6 +51,7 @@ type flags struct {
 	oneFS       bool
 	resume      string
 	noFsync     bool
+	noSuid      bool
 	stopErr     bool
 	noTUI       bool
 	quiet       bool
@@ -129,6 +130,7 @@ func addTransferFlags(fs *flag.FlagSet, f *flags) {
 	fs.BoolVar(&f.oneFS, "one-file-system", false, "do not cross filesystem boundaries")
 	fs.StringVar(&f.resume, "resume", "on", "resume mode: on | size | fresh")
 	fs.BoolVar(&f.noFsync, "no-fsync", false, "skip fsync before finalize")
+	fs.BoolVar(&f.noSuid, "no-suid", false, "receiver: strip setuid/setgid bits from received files\n(defense for a root receiver against an untrusted sender)")
 	fs.BoolVar(&f.stopErr, "stop-on-error", false, "abort the transfer on the first file error")
 	fs.BoolVar(&f.probe, "probe", false, "probe the server (RTT/version) and exit")
 }

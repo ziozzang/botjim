@@ -28,6 +28,7 @@ type Options struct {
 	Include     []string         // walker inclusions
 	LimitBPS    int64            // send-rate cap (0 = unlimited)
 	DryRun      bool             // plan only
+	NoSuid      bool             // receiver: strip setuid/setgid from received modes
 	OnCommit    func(rel string) // receiver: a file finished and verified (nil = no hook)
 }
 

@@ -310,13 +310,16 @@ func (w *Walker) walkDir(ctx context.Context, path, rel string, emit func(Entry)
 			w.skip(child, "excluded by --exclude")
 			continue
 		}
-		if len(w.Opts.Include) > 0 && !excluded(childRel, w.Opts.Include) {
-			w.skip(child, "not matched by --include")
-			continue
-		}
 		ci, err := byName[name].Info()
 		if err != nil {
 			w.skip(child, "lstat: "+err.Error())
+			continue
+		}
+		// --include filters LEAVES only: a directory must always be
+		// descended into, or a pattern like "*.txt" prunes every
+		// containing directory first and matches nothing nested
+		if len(w.Opts.Include) > 0 && !ci.IsDir() && !excluded(childRel, w.Opts.Include) {
+			w.skip(child, "not matched by --include")
 			continue
 		}
 		if w.Opts.OneFS && w.devOf(child) != parentDev {

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/pkg/xattr"
 	"golang.org/x/sys/unix"
@@ -218,6 +219,9 @@ func applyXattrsFD(fd *os.File, e manifest.Entry) []Warning {
 	var ws []Warning
 	xs := sortedXattrs(e)
 	for _, x := range xs {
+		if !safeXattrName(x.Name) {
+			continue // never apply security.*/system.*/trusted.* from a peer
+		}
 		if err := xattr.FSet(fd, x.Name, x.Value); err != nil {
 			if isEPERMish(err) || errors.Is(err, unix.ENOTSUP) {
 				continue // security.*/trusted.* on unprivileged receiver: skip quietly
@@ -232,6 +236,9 @@ func applyXattrsPath(abs string, e manifest.Entry) []Warning {
 	var ws []Warning
 	xs := sortedXattrs(e)
 	for _, x := range xs {
+		if !safeXattrName(x.Name) {
+			continue
+		}
 		if err := xattr.LSet(abs, x.Name, x.Value); err != nil {
 			if isEPERMish(err) || errors.Is(err, unix.ENOTSUP) {
 				continue
@@ -240,6 +247,15 @@ func applyXattrsPath(abs string, e manifest.Entry) []Warning {
 		}
 	}
 	return ws
+}
+
+// safeXattrName gates which xattrs a received manifest may set. Only the
+// user.* namespace is honored: security.capability (file capabilities),
+// system.posix_acl_* (ACLs) and trusted.* are privilege- or ACL-bearing
+// and a malicious sender could otherwise set them on a root receiver
+// (e.g. cap_setuid on an attacker-supplied binary — remote root).
+func safeXattrName(name string) bool {
+	return strings.HasPrefix(name, "user.")
 }
 
 func sortedXattrs(e manifest.Entry) []manifest.Xattr {

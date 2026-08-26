@@ -8,11 +8,11 @@ import (
 
 // The command table completions are generated from.
 var completionCommands = []struct{ name, opts string }{
-	{"server", "--bind --root --port --map-owners --parallel --no-fsync --no-tui --token --pass --cloak --discover --metrics -q -v --log-file --audit --audit-file"},
-	{"send", "--via --code --port --dest --compress --zstd-level --parallel --map-owners --no-xattr --no-sparse --devices --one-file-system --resume --no-fsync --stop-on-error --probe --token --pass --cloak --limit --retries --dry-run --exclude --include --json --delete --no-tui -q -v --log-file --audit --audit-file"},
-	{"pull", "--port --dest --compress --zstd-level --parallel --map-owners --no-xattr --no-sparse --devices --one-file-system --resume --no-fsync --stop-on-error --probe --token --pass --cloak --limit --retries --dry-run --exclude --include --json --delete --no-tui -q -v --log-file --audit --audit-file"},
+	{"server", "--bind --root --port --map-owners --parallel --no-fsync --no-suid --no-tui --token --pass --cloak --discover --metrics -q -v --log-file --audit --audit-file"},
+	{"send", "--via --code --port --dest --compress --zstd-level --parallel --map-owners --no-xattr --no-sparse --devices --one-file-system --resume --no-fsync --no-suid --stop-on-error --probe --token --pass --cloak --limit --retries --dry-run --exclude --include --json --delete --no-tui -q -v --log-file --audit --audit-file"},
+	{"pull", "--port --dest --compress --zstd-level --parallel --map-owners --no-xattr --no-sparse --devices --one-file-system --resume --no-fsync --no-suid --stop-on-error --probe --token --pass --cloak --limit --retries --dry-run --exclude --include --json --delete --no-tui -q -v --log-file --audit --audit-file"},
 	{"relay", "--bind --port --wait --spool-max --spool-mem --spool-dir --no-spool-disk"},
-	{"recv", "--via --code --dest --map-owners --parallel --no-fsync --no-tui -q -v --log-file --audit --audit-file"},
+	{"recv", "--via --code --dest --map-owners --parallel --no-fsync --no-suid --no-tui -q -v --log-file --audit --audit-file"},
 	{"swarm seed", "--tracker --code --port --name"},
 	{"swarm join", "--tracker --code --spec --dest --parallel --serve --http --verify-key"},
 	{"swarm track", "--port"},

@@ -42,6 +42,7 @@ type ServerConfig struct {
 	Root        string // absolute, symlink-resolved jail
 	Parallel    int
 	Fsync       bool
+	NoSuid      bool
 	OwnerPolicy attrs.OwnerPolicy
 	AllowPush   bool
 	AllowPull   bool
@@ -179,7 +180,10 @@ func (s *Server) handleConn(raw net.Conn) {
 	remote := raw.RemoteAddr().String()
 	// cloak demux: HTTP-looking connections upgrade inside ServeCloak;
 	// plain FSY1 bytes go straight through
-	if s.cfg.Cloak != "" && transport.CloakServe != nil {
+	// require CloakPlain too: without it a sniffed-but-plain (FSY1) client's
+	// buffered handshake bytes would be stranded in br and lost. hooks.go
+	// installs all cloak hooks together, so this is only a safety guard.
+	if s.cfg.Cloak != "" && transport.CloakServe != nil && transport.CloakPlain != nil {
 		// the sniff blocks until 4 bytes arrive: bound it, or an idle
 		// connection parks this goroutine forever
 		_ = raw.SetReadDeadline(time.Now().Add(15 * time.Second))
@@ -190,7 +194,7 @@ func (s *Server) handleConn(raw net.Conn) {
 				return // decoy answered; not our session
 			}
 			raw = wrapped
-		} else if transport.CloakPlain != nil {
+		} else {
 			// not HTTP: replay the sniffed bytes to the plain path —
 			// they live in br's buffer now, not on the socket
 			raw = transport.CloakPlain(raw, br)
@@ -326,6 +330,7 @@ func (s *Server) runTransfer(sess *transport.Session, ctrl *protocol.CtrlStream,
 		Resume:      init.Resume,
 		Preserve:    init.Preserve,
 		Fsync:       s.cfg.Fsync,
+		NoSuid:      s.cfg.NoSuid,
 		OwnerPolicy: s.cfg.OwnerPolicy,
 		Nonce:       sess.HS.NonceHex(),
 		Exclude:     s.cfg.Exclude,
@@ -447,6 +452,7 @@ type ClientConfig struct {
 	Resume      uint8
 	Preserve    uint16
 	Fsync       bool
+	NoSuid      bool
 	OwnerPolicy attrs.OwnerPolicy
 	Timeout     time.Duration
 }
@@ -584,6 +590,7 @@ func RunWithProgress(ctx context.Context, cfg ClientConfig, reg *progress.Regist
 		Resume:      cfg.Resume,
 		Preserve:    cfg.Preserve,
 		Fsync:       cfg.Fsync,
+		NoSuid:      cfg.NoSuid,
 		OwnerPolicy: cfg.OwnerPolicy,
 		Nonce:       sess.HS.NonceHex(),
 		Exclude:     cfg.Exclude,

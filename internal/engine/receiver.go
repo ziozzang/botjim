@@ -388,6 +388,9 @@ func (r *Receiver) processEntry(ctx context.Context, e manifest.Entry) {
 	if ctx.Err() != nil {
 		return
 	}
+	if r.opts.NoSuid {
+		e.Mode &^= 0o6000 // drop setuid/setgid before any attribute apply
+	}
 	r.reg.AddFile(e.ID, e.RelPath, e.Size)
 	// the manifest is remote input: its grid fields are suggestions until
 	// normalized. Without this, a crafted entry panics the process
@@ -466,6 +469,14 @@ func (r *Receiver) processEntry(ctx context.Context, e manifest.Entry) {
 		r.mu.Unlock()
 		r.okEntry(e, "")
 	case manifest.KindFIFO, manifest.KindCharDev, manifest.KindBlockDev:
+		// device/FIFO nodes are created only when the operator opted in
+		// with --devices: a malicious sender must not be able to drop a
+		// block/char node (a window onto raw devices on a root receiver)
+		// regardless of what was negotiated
+		if r.opts.Preserve&protocol.PreserveDevices == 0 {
+			r.failEntry(e, CodePerm, "device/special files require --devices")
+			return
+		}
 		if err := attrs.MakeNode(abs, e); err != nil {
 			r.failEntry(e, CodePerm, err.Error())
 			return
@@ -959,7 +970,7 @@ func (r *Receiver) absorbChunk(codec compress.Codec, hdr protocol.ChunkHeader, p
 		return nil // stale chunk after resolution: drop quietly
 	}
 	grid := f.entry.Grid()
-	if int64(hdr.ChunkIdx) >= grid.Count() {
+	if grid.Count() < 0 || hdr.ChunkIdx >= uint64(grid.Count()) {
 		return fmt.Errorf("chunk %d out of range", hdr.ChunkIdx)
 	}
 	idx := int64(hdr.ChunkIdx)
@@ -1009,14 +1020,17 @@ func (r *Receiver) absorbChunk(codec compress.Codec, hdr protocol.ChunkHeader, p
 			}
 		}
 		f.mu.Lock()
+		firstArrival := f.arrived == nil || !f.arrived[idx]
 		f.sc.SetHave(idx, chunking.ZeroHash, true)
 		f.dirty = true
 		if f.arrived != nil {
 			f.arrived[idx] = true
 		}
 		f.mu.Unlock()
-		r.reg.AddSent(expected)
-		r.reg.FileDoneBytes(hdr.FileID, expected)
+		if firstArrival {
+			r.reg.AddSent(expected)
+			r.reg.FileDoneBytes(hdr.FileID, expected)
+		}
 		r.maybeComplete(f, hdr.FileID)
 		return nil
 	}
@@ -1043,14 +1057,17 @@ func (r *Receiver) absorbChunk(codec compress.Codec, hdr protocol.ChunkHeader, p
 	}
 	h := chunking.ChunkSHA(f.entry.RelPath, idx, data)
 	f.mu.Lock()
+	firstArrival := f.arrived == nil || !f.arrived[idx]
 	f.sc.SetHave(idx, h, false)
 	f.dirty = true
 	if f.arrived != nil {
 		f.arrived[idx] = true
 	}
 	f.mu.Unlock()
-	r.reg.AddSent(expected)
-	r.reg.FileDoneBytes(hdr.FileID, expected)
+	if firstArrival {
+		r.reg.AddSent(expected)
+		r.reg.FileDoneBytes(hdr.FileID, expected)
+	}
 	r.maybeComplete(f, hdr.FileID)
 	return nil
 }

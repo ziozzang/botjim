@@ -119,6 +119,12 @@ func Listen(ctx context.Context, window time.Duration) ([]Peer, error) {
 		if src.IP.To4() == nil {
 			continue
 		}
+		// beacon fields are attacker-controlled LAN input printed to a
+		// terminal by `botjim peers`: a control/ANSI sequence in Name/Ver/
+		// Root could rewrite the screen or spoof rows. Drop such beacons.
+		if hasControl(b.Name) || hasControl(b.Ver) || hasControl(b.Root) {
+			continue
+		}
 		p := Peer{Beacon: b, Addr: net.JoinHostPort(src.IP.String(), strconv.Itoa(b.Port)), Last: time.Now()}
 		mu.Lock()
 		seen[p.Addr] = p
@@ -135,4 +141,17 @@ func Listen(ctx context.Context, window time.Duration) ([]Peer, error) {
 		return out[i].Addr < out[j].Addr
 	})
 	return out, nil
+}
+
+// hasControl reports whether s contains any C0/C1 control byte (including
+// ESC, CR, and DEL) — such bytes in a beacon field are terminal-injection
+// attempts and disqualify the beacon.
+func hasControl(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c == 0x7f {
+			return true
+		}
+	}
+	return false
 }

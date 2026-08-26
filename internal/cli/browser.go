@@ -33,7 +33,7 @@ func buildClientConfig(f *flags, addr string, alg uint8, resume uint8, owners at
 			Addr: addr, Direction: dir, Paths: paths, DestRoot: f.dest,
 			Compression: alg, ZstdLevel: compress.NormalizeZstdLevel(f.zstdLvl),
 			Parallel: f.parallel, Resume: resume, Preserve: p,
-			Fsync: !f.noFsync, OwnerPolicy: owners,
+			Fsync: !f.noFsync, NoSuid: f.noSuid, OwnerPolicy: owners,
 			Token: f.token, Pass: f.pass,
 			Exclude: f.exclude, Include: f.include, LimitBPS: f.limitB,
 		}, reg
@@ -49,6 +49,7 @@ func buildClientConfig(f *flags, addr string, alg uint8, resume uint8, owners at
 		Resume:      resume,
 		Preserve:    preserveBits(f),
 		Fsync:       !f.noFsync,
+		NoSuid:      f.noSuid,
 		OwnerPolicy: owners,
 		Token:       f.token,
 		Pass:        f.pass,

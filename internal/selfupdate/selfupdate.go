@@ -1,8 +1,15 @@
 // Package selfupdate replaces the running botjim binary with the latest
-// GitHub release build. It is stdlib-only and integrity-first: every
-// downloaded binary is checked against the SHA-256 recorded in the release's
-// SHA256SUMS asset before it is allowed to take the place of the running
-// executable.
+// GitHub release build. It is stdlib-only: every downloaded binary is
+// checked against the SHA-256 recorded in the release's SHA256SUMS asset
+// before it replaces the running executable.
+//
+// Trust model: the checksum protects against corruption and truncation.
+// It is NOT a signature — SHA256SUMS is fetched from the same release over
+// TLS, so authenticity rests on transport security plus the integrity of
+// the GitHub release itself. A compromised release (or CA) could serve a
+// malicious binary with a matching SHA256SUMS. A detached signature over
+// SHA256SUMS verified against an embedded public key would close that gap;
+// it is not yet implemented.
 package selfupdate
 
 import (
@@ -175,10 +182,16 @@ func Checksums(ctx context.Context, client *http.Client, rel *Release) (map[stri
 	}
 	sums := map[string]string{}
 	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimRight(line, "\r")
 		fields := strings.Fields(line)
-		if len(fields) == 2 {
-			sums[fields[1]] = strings.ToLower(fields[0])
+		if len(fields) < 2 {
+			continue
 		}
+		// "<hash> <name>" (text mode) or "<hash> *<name>" (GNU binary
+		// mode); the name is everything after the first field, so a name
+		// with spaces survives, and a leading '*' marker is stripped
+		name := strings.TrimPrefix(strings.TrimSpace(line[len(fields[0]):]), "*")
+		sums[name] = strings.ToLower(fields[0])
 	}
 	return sums, nil
 }
@@ -216,7 +229,11 @@ func DownloadVerified(ctx context.Context, client *http.Client, asset Asset, wan
 		return "", err
 	}
 	got := hex.EncodeToString(h.Sum(nil))
-	if wantSHA != "" && !strings.EqualFold(got, wantSHA) {
+	if wantSHA == "" {
+		_ = os.Remove(tmpName)
+		return "", fmt.Errorf("refusing to install %s: no expected checksum", asset.Name)
+	}
+	if !strings.EqualFold(got, wantSHA) {
 		_ = os.Remove(tmpName)
 		return "", fmt.Errorf("checksum mismatch for %s: got %s, want %s", asset.Name, got, wantSHA)
 	}
