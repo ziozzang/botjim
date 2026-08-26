@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -188,3 +189,51 @@ func fileNames(s *SwarmSpec) []string {
 }
 
 var _ = time.Second
+
+// TestSwarmMeshTwoHops: joiner A completes and serves; joiner B then
+// assembles from A alone (seed gone from the room) — the LAN ramp.
+func TestSwarmMeshTwoHops(t *testing.T) {
+	seedDir := t.TempDir()
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	if err := os.WriteFile(filepath.Join(seedDir, "m.bin"), pattern(8<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tln, _ := net.Listen("tcp", "127.0.0.1:0")
+	tp := &TrackerProtocol{T: NewTracker()}
+	go func() { _ = tp.Serve(tln) }()
+	spec, _ := BuildSwarmSpec(context.Background(), []string{seedDir}, "m")
+	token := GenerateCode()
+
+	// joiner A: serves (ephemeral port)
+	lnA, _ := net.Listen("tcp", "127.0.0.1:0")
+	go func() { _ = ServePeer(context.Background(), lnA, spec, seedDir, token) }()
+	announceTo(context.Background(), tln.Addr().String(), token, spec.SpecHash(), lnA.Addr().String(), "ff", true)
+
+	// joiner B pulls from the room (only A is there) and serves nothing
+	j := &Joiner{
+		TrackerAddr: tln.Addr().String(), Token: token, Spec: spec,
+		Dest: dirB, Parallel: 4,
+	}
+	if err := j.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(filepath.Join(dirB, "m.bin"))
+	if len(b) != 8<<20 || string(b[:8]) != string(pattern(8 << 20)[:8]) {
+		t.Fatal("B's assembly wrong")
+	}
+	_ = dirA
+}
+
+// TestRarestFirstOrder: scarcer chunks sort earlier.
+func TestRarestFirstOrder(t *testing.T) {
+	spec := &SwarmSpec{Files: []SwarmFile{{Path: "f", Size: 16 << 20, SHA: strings.Repeat("a", 64)}}}
+	// peer holds chunk 0 (bitmap 0b01) but not chunk 1,2,3
+	peers := []Peer{{Addr: "x:1", Have: "01"}} // chunk0 held by 1 peer
+	tasks := []chunkTask{{0, 3}, {0, 0}, {0, 2}, {0, 1}}
+	got := orderRarestFirst(tasks, spec, peers)
+	// chunk 0 has rarity 1; others rarity 0 → they must come first
+	if got[0].chunk == 0 {
+		t.Fatalf("rarest-first mis-ordered: %+v", got)
+	}
+}

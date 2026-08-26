@@ -50,6 +50,7 @@ func cmdServer(args []string) int {
 		return 3
 	}
 
+	applyConfigFromDefaults(f, args)
 	ctx := signalContext()
 	if err := runServer(ctx, f, owners); err != nil {
 		fmt.Fprintln(os.Stderr, "server error:", err)

@@ -161,6 +161,7 @@ func swarmJoin(args []string) int {
 		spec    string
 		dest    string
 		par     int
+		serve   string
 	)
 	fs := newFlagSet("swarm join", "botjim swarm join [flags] --code CODE",
 		"Assemble the artifact into --dest: fetch missing chunks from any\npeer (seed or other joiners), verify each file, resume on re-run.")
@@ -169,6 +170,7 @@ func swarmJoin(args []string) int {
 	fs.StringVar(&spec, "spec", "", "path to <name>.swarm.json from the seed (required)")
 	fs.StringVar(&dest, "dest", ".", "directory to assemble into")
 	fs.IntVar(&par, "parallel", 4, "concurrent chunk fetches")
+	fs.StringVar(&serve, "serve", ":0", "also serve verified chunks to other joiners\n(the mesh ramp: peers on your LAN fetch from you; \"\" disables)")
 	if err := fs.Parse(args); err != nil {
 		if parseHelp(err) {
 			return 0
@@ -208,6 +210,7 @@ func swarmJoin(args []string) int {
 		Spec:        full,
 		Dest:        dest,
 		Parallel:    par,
+		ServeAddr:   serve,
 		OnProgress: func(done, total int64) {
 			fmt.Fprintf(os.Stderr, "\r%6.1f%% %s/%s",
 				float64(done)/float64(total)*100, humanBytes(uint64(done)), humanBytes(uint64(total)))

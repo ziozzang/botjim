@@ -72,8 +72,17 @@ type Registry struct {
 
 	Events chan Event
 
-	logMu sync.Mutex
-	logW  io.Writer // optional persistent transfer log
+	logMu  sync.Mutex
+	logW   io.Writer // optional persistent transfer log
+	sinkMu sync.Mutex
+	sink   func(Event) // optional structured sink (audit journal)
+}
+
+// SetEventSink installs a structured event sink (the audit journal).
+func (r *Registry) SetEventSink(f func(Event)) {
+	r.sinkMu.Lock()
+	r.sink = f
+	r.sinkMu.Unlock()
 }
 
 // SetLogWriter installs a plain-text sink: every event is appended there
@@ -166,6 +175,12 @@ func (r *Registry) AddSkipped(n int64) { r.skippedBytes.Add(uint64(n)) }
 // full, and appends a timestamped line to the persistent log sink.
 func (r *Registry) Emit(kind, path, msg string) {
 	now := time.Now()
+	if r.sink != nil {
+		r.sinkMu.Lock()
+		f := r.sink
+		r.sinkMu.Unlock()
+		f(Event{Kind: kind, Path: path, Msg: msg, At: now})
+	}
 	if r.logW != nil {
 		r.logMu.Lock()
 		fmt.Fprintf(r.logW, "%s %-10s %s %s\n", now.Format(time.RFC3339), kind, path, msg)

@@ -58,13 +58,15 @@ type flags struct {
 	probe     bool
 	logFile   string
 	rest      []string
-	via       string   // relay address for --via transfers
-	code      string   // relay pairing code
-	token     string   // shared-secret auth
-	pass      string   // passphrase record-layer encryption
-	limit     string   // bandwidth cap (e.g. 100M)
-	limitB    int64    // parsed
-	retries   int      // auto-reconnect attempts
+	via       string // relay address for --via transfers
+	code      string // relay pairing code
+	token     string // shared-secret auth
+	pass      string // passphrase record-layer encryption
+	limit     string // bandwidth cap (e.g. 100M)
+	limitB    int64  // parsed
+	retries   int    // auto-reconnect attempts
+	audit     bool
+	auditFile string
 	exclude   []string // walker exclusions
 	include   []string // walker inclusions (when set, only these)
 	dryRun    bool
@@ -99,6 +101,8 @@ func addCommonFlags(fs *flag.FlagSet, f *flags) {
 	fs.BoolVar(&f.quiet, "q", false, "quiet (errors only)")
 	fs.BoolVar(&f.verbose, "v", false, "verbose")
 	fs.StringVar(&f.logFile, "log-file", "", "append the transfer log to this file\n(default ~/.cache/botjim/transfers.log)")
+	fs.BoolVar(&f.audit, "audit", false, "record a tamper-evident hash-chained audit journal")
+	fs.StringVar(&f.auditFile, "audit-file", "", "audit journal path (default ~/.cache/botjim/audit.log)")
 }
 
 // addTransferFlags registers the flags send/pull (and the legacy client) accept.
@@ -132,6 +136,10 @@ func Main(args []string) int {
 		return cmdRelay(args[1:])
 	case "swarm":
 		return cmdSwarm(args[1:])
+	case "audit":
+		return cmdAudit(args[1:])
+	case "config":
+		return cmdConfig(args[1:])
 	case "recv":
 		return cmdRecv(args[1:])
 	case "send":
@@ -179,6 +187,8 @@ usage:
   botjim send HOST[:port]                      no paths: MC-style picker
 
   botjim swarm seed/join/track/verify         token-joined swarm distribution
+  botjim audit verify|tail FILE               hash-chain journal reader
+  botjim config path|show                     ~/.botjim/config.json defaults
   botjim relay                                 run the pairing broker
   botjim send --via RELAY PATH...              push through a relay (prints a code)
   botjim recv --via RELAY --code CODE          receive a relay push

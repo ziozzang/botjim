@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ziozzang/botjim/internal/attrs"
+	"github.com/ziozzang/botjim/internal/audit"
 	"github.com/ziozzang/botjim/internal/compress"
 	"github.com/ziozzang/botjim/internal/progress"
 	"github.com/ziozzang/botjim/internal/protocol"
@@ -143,12 +144,32 @@ func openTransferLog(f *flags, reg *progress.Registry) string {
 	transferLogFile = w
 	transferLogMu.Unlock()
 	reg.SetLogWriter(lockingWriter{w})
+	// hash-chained audit journal (same events, tamper-evident)
+	if f.audit {
+		ap := f.auditFile
+		if ap == "" {
+			dir, _ := os.UserCacheDir()
+			ap = filepath.Join(dir, "botjim", "audit.log")
+		}
+		if j, err := audit.Open(ap); err == nil {
+			transferAuditMu.Lock()
+			transferAudit = j
+			transferAuditMu.Unlock()
+			reg.SetEventSink(func(e progress.Event) {
+				j.Append(e.At.Format(time.RFC3339Nano), e.Kind, map[string]string{
+					"path": e.Path, "msg": e.Msg,
+				})
+			})
+		}
+	}
 	return path
 }
 
 var (
 	transferLogMu   sync.Mutex
 	transferLogFile *os.File
+	transferAuditMu sync.Mutex
+	transferAudit   *audit.Journal
 )
 
 type lockingWriter struct{ w io.Writer }
@@ -166,4 +187,10 @@ func closeTransferLog() {
 		transferLogFile = nil
 	}
 	transferLogMu.Unlock()
+	transferAuditMu.Lock()
+	if transferAudit != nil {
+		_ = transferAudit.Close()
+		transferAudit = nil
+	}
+	transferAuditMu.Unlock()
 }

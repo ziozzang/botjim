@@ -85,6 +85,7 @@ func cmdSend(args []string, pull bool) int {
 		f.rest = positionals[1:]
 	}
 
+	applyConfigFromDefaults(f, args)
 	ctx := signalContext()
 	return runClient(ctx, f)
 }

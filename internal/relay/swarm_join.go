@@ -6,12 +6,16 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/ziozzang/botjim/internal/chunking"
 )
+
+// chunkTask is one (file, chunk) fetch.
+type chunkTask struct{ file, chunk int64 }
 
 // Joiner assembles one artifact from the swarm: it announces to the
 // tracker, fetches missing chunks from any peer that holds them (the
@@ -26,9 +30,15 @@ type Joiner struct {
 	Dest        string
 	Parallel    int
 	OnProgress  func(done, total int64)
+	// ServeAddr, when set, starts a chunk server on that address so other
+	// joiners can fetch from this node (the mesh ramp: bytes enter each
+	// LAN once). "" disables serving.
+	ServeAddr string
 
-	mu    sync.Mutex
-	parts map[string]*os.File // rel path → part fd (lazy init)
+	mu       sync.Mutex
+	parts    map[string]*os.File // rel path → part fd (lazy init)
+	verified map[string]bool     // rel path → passed whole-file SHA
+	serveLn  net.Listener
 }
 
 // Run drives one join to completion (all files verified) or ctx death.
@@ -39,15 +49,24 @@ func (j *Joiner) Run(ctx context.Context) error {
 	if j.parts == nil {
 		j.parts = map[string]*os.File{}
 	}
+	if j.verified == nil {
+		j.verified = map[string]bool{}
+	}
+	// mesh: serve verified chunks to other joiners while we download
+	if j.ServeAddr != "" {
+		if err := j.startServing(ctx); err != nil {
+			return err
+		}
+	}
 	peers := j.announce(ctx, j.catalog())
 	if len(peers) == 0 {
 		return fmt.Errorf("swarm: no peers for this token (is the seed running?)")
 	}
 
 	// build the chunk task list: (fileIdx, chunkIdx) for everything the
-	// local catalog does not hold
-	type task struct{ file, chunk int64 }
-	var tasks []task
+	// local catalog does not hold, then order rarest-first (fewest peers
+	// hold it → fetch early so it propagates widest)
+	var tasks []chunkTask
 	var total, done int64
 	for fi, f := range j.Spec.Files {
 		grid := chunking.Grid{Size: f.Size, ChunkSize: chunking.ChunkSizeFor(f.Size)}
@@ -55,16 +74,17 @@ func (j *Joiner) Run(ctx context.Context) error {
 		have := j.localChunks(f, grid)
 		for ci := int64(0); ci < grid.Count(); ci++ {
 			if !have[ci] {
-				tasks = append(tasks, task{file: int64(fi), chunk: ci})
+				tasks = append(tasks, chunkTask{file: int64(fi), chunk: ci})
 			}
 		}
 	}
+	tasks = orderRarestFirst(tasks, j.Spec, peers)
 	if j.OnProgress != nil {
 		j.OnProgress(0, total)
 	}
 
 	// fetch workers over a shared task queue
-	taskCh := make(chan task, 64)
+	taskCh := make(chan chunkTask, 64)
 	var wg sync.WaitGroup
 	var errOnce sync.Once
 	var fatal error
@@ -154,13 +174,16 @@ func (j *Joiner) fetchWithRetry(ctx context.Context, peers []Peer, fileIdx, chun
 // re-request, same rule as the transfer engine's rebuild path).
 func (j *Joiner) localChunks(f SwarmFile, grid chunking.Grid) []bool {
 	have := make([]bool, grid.Count())
-	// fast path: a verified final file needs nothing
+	// fast path: a verified final file needs nothing (and is serveable)
 	if fi, err := os.Stat(filepath.Join(j.Dest, f.Path)); err == nil && fi.Size() == f.Size {
 		sum, err := hashFile(filepath.Join(j.Dest, f.Path))
 		if err == nil && sum == f.SHA {
 			for i := range have {
 				have[i] = true
 			}
+			j.mu.Lock()
+			j.verified[f.Path] = true
+			j.mu.Unlock()
 			return have
 		}
 	}
@@ -259,7 +282,75 @@ func (j *Joiner) finalize(f SwarmFile) error {
 	if err := os.Rename(part, abs); err != nil {
 		return err
 	}
+	j.mu.Lock()
+	j.verified[f.Path] = true
+	j.mu.Unlock()
 	return nil
+}
+
+// startServing exposes verified chunks to the swarm on ServeAddr.
+func (j *Joiner) startServing(ctx context.Context) error {
+	host, port, err := net.SplitHostPort(j.ServeAddr)
+	if err != nil || port == "" {
+		host, port = j.ServeAddr, "0"
+	}
+	bind := net.JoinHostPort(host, port)
+	ln, err := net.Listen("tcp", bind)
+	if err != nil {
+		return err
+	}
+	j.mu.Lock()
+	j.serveLn = ln
+	j.mu.Unlock()
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+	}()
+	go func() { _ = ServePeer(ctx, ln, j.Spec, j.Dest, j.Token) }()
+	return nil
+}
+
+// ServeListenAddr returns the bound serving address ("" when not serving).
+func (j *Joiner) ServeListenAddr() string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.serveLn == nil {
+		return ""
+	}
+	return j.serveLn.Addr().String()
+}
+
+// orderRarestFirst sorts tasks ascending by how many peers hold each
+// chunk (from announce bitmaps): the scarcest chunks move first so they
+// propagate widest; common chunks mop up at the end.
+func orderRarestFirst(tasks []chunkTask, spec *SwarmSpec, peers []Peer) []chunkTask {
+	if len(peers) == 0 {
+		return tasks
+	}
+	// decode each peer's per-file bitmaps
+	type key struct{ f, c int64 }
+	rarity := map[key]int{}
+	for _, p := range peers {
+		perFile := strings.Split(p.Have, "/")
+		for fi := range spec.Files {
+			if fi >= len(perFile) {
+				continue
+			}
+			bm, err := catalogDecode(perFile[fi])
+			if err != nil {
+				continue
+			}
+			for ci := 0; ci < len(bm)*8; ci++ {
+				if bm[ci/8]&(1<<(uint(ci)%8)) != 0 {
+					rarity[key{int64(fi), int64(ci)}]++
+				}
+			}
+		}
+	}
+	sort.SliceStable(tasks, func(a, b int) bool {
+		return rarity[key{tasks[a].file, tasks[a].chunk}] < rarity[key{tasks[b].file, tasks[b].chunk}]
+	})
+	return tasks
 }
 
 // catalog returns the joiner's current have-bitmap for the announce line
@@ -282,13 +373,13 @@ func (j *Joiner) catalog() string {
 
 // announce registers with the tracker and returns the member list.
 func (j *Joiner) announce(ctx context.Context, have string) []Peer {
-	return announceTo(ctx, j.TrackerAddr, j.Token, j.Spec.SpecHash(), j.listen(), have, false)
+	return announceTo(ctx, j.TrackerAddr, j.Token, j.Spec.SpecHash(), j.ServeListenAddr(), have, false)
 }
 
 // listen is the peer's serving address (joiners serve too — swarm rule).
 // v0.5: joiners announce a placeholder; serving-side listen lands with
 // the serve loop below.
-func (j *Joiner) listen() string { return "" }
+func (j *Joiner) listen() string { return j.ServeListenAddr() }
 
 // announceTo is the tracker client shared by seed and joiner.
 func announceTo(ctx context.Context, trackerAddr, token, specHash, selfAddr, have string, seed bool) []Peer {
