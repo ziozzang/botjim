@@ -51,7 +51,7 @@ func (m *SwarmManifest) Verify(expectedPub string) error {
 		return nil
 	}
 	if expectedPub != "" && !strings.EqualFold(m.PubKey, expectedPub) {
-		return fmt.Errorf("signed by a different key (%s…)", m.PubKey[:16])
+		return fmt.Errorf("signed by a different key (%s…)", truncHex(m.PubKey, 16))
 	}
 	pub, err := hex.DecodeString(m.PubKey)
 	if err != nil || len(pub) != ed25519.PublicKeySize {
@@ -65,6 +65,15 @@ func (m *SwarmManifest) Verify(expectedPub string) error {
 		return errors.New("signature verification failed — the spec was modified or corrupted")
 	}
 	return nil
+}
+
+// truncHex shortens a hex string for display without panicking on
+// attacker-chosen short values.
+func truncHex(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }
 
 // Signed reports whether the descriptor carries a signature.
@@ -82,10 +91,17 @@ func DefaultMeshKeyPath() string {
 // LoadOrCreateEd25519Key returns the key at path, generating it when
 // missing (0600, parents created).
 func LoadOrCreateEd25519Key(path string) (ed25519.PrivateKey, error) {
-	if _, err := os.Stat(path); err == nil {
+	_, err := os.Stat(path)
+	switch {
+	case err == nil:
 		return LoadSwarmKey(path)
+	case os.IsNotExist(err):
+		return GenerateSwarmKey(path)
+	default:
+		// EACCES, ELOOP, …: never silently mint a new identity over an
+		// unreadable existing key
+		return nil, fmt.Errorf("mesh key %s: %w", path, err)
 	}
-	return GenerateSwarmKey(path)
 }
 
 // DefaultSwarmKeyPath is the conventional signer key location.

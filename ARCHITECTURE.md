@@ -58,9 +58,21 @@ Data streams: each sender worker owns one stream; frames are
 `type | fileID | chunkIdx | flags | len | payload`. Chunk identity is
 `SHA-256(path ‖ index ‖ data)` computed independently by both sides — a
 chunk written at the wrong offset fails verification even if its bytes are
-intact. Zero chunks (sparse holes) travel as a flag with no payload; raw
-fallback skips compression for incompressible chunks; decompression is
-bounded by the expected chunk length from the manifest (bomb-proofing).
+intact. When both peers advertise the `ChunkSum` feature bit, every data
+frame also carries a trailing crc32c over its identity + body: raw
+(incompressible) chunks otherwise had only TCP's 16-bit checksum on the
+wire, while zstd frames self-check. Zero chunks (sparse holes) travel as a
+flag with no payload; raw fallback skips compression for incompressible
+chunks; decompression is bounded by the expected chunk length from the
+manifest (bomb-proofing).
+
+Delta adoption (a same-size destination file re-hashed into its own part)
+and sidecar-less resume send their have-claims as *untrusted*: the bitmap
+is accompanied by per-chunk hashes, and the sender re-hashes its own bytes
+before honoring a skip. When every claim verifies the sender sends
+`Commit`; when some fail it sends `ClaimResult` (the verified bitmap) so
+the receiver finalizes only after the still-in-flight corrections land —
+never on its own optimistic claim.
 
 ## Transfer flow
 

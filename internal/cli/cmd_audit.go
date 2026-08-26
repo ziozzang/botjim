@@ -13,11 +13,14 @@ import (
 // journal's reader. verify walks the chain and reports the intact prefix;
 // tail prints the last entries.
 func cmdAudit(args []string) int {
-	if len(args) == 0 {
+	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
 		fmt.Fprint(os.Stderr, `usage:
   botjim audit verify FILE        check the hash chain, report the intact prefix
   botjim audit tail FILE [N]      print the last N entries (default 20)
 `)
+		if len(args) >= 1 {
+			return 0
+		}
 		return 3
 	}
 	switch args[0] {

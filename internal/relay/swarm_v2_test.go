@@ -145,3 +145,19 @@ func TestSwarmHTTPSource(t *testing.T) {
 		t.Fatal("HTTP-assembled bytes differ")
 	}
 }
+
+// TestChunkOKFailsClosedOnShortCatalog: a catalog that does not cover
+// the grid is corrupt — every chunk beyond it must fail verification.
+func TestChunkOKFailsClosedOnShortCatalog(t *testing.T) {
+	f := SwarmFile{Path: "x", Size: 9 << 20, Chunks: []string{"aa"}} // 1 entry, grid has 2
+	if chunkOK(f, 0, []byte{0}) {
+		t.Fatal("chunk 0 verified against wrong-length catalog entry")
+	}
+	if chunkOK(f, 1, []byte{0}) {
+		t.Fatal("chunk beyond catalog accepted")
+	}
+	v1 := SwarmFile{Path: "x", Size: 9 << 20} // no catalog: defer to finalize
+	if !chunkOK(v1, 1, []byte{0}) {
+		t.Fatal("v1 (no catalog) must defer, not reject")
+	}
+}

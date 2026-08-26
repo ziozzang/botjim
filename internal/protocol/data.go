@@ -3,6 +3,7 @@ package protocol
 import (
 	"bufio"
 	"fmt"
+	"hash/crc32"
 	"io"
 
 	"encoding/binary"
@@ -20,6 +21,13 @@ const (
 	ChunkFlagZero     uint8 = 1 << 0 // all-zero chunk: no payload, receiver leaves a hole
 	ChunkFlagRaw      uint8 = 1 << 1 // payload not compressed (fallback or alg=none)
 	ChunkFlagLastFile uint8 = 1 << 2 // last chunk of this file (diagnostics only)
+	// ChunkFlagSum: the payload ends with a 4-byte LE crc32c over the
+	// frame identity (fileID, chunkIdx, flags sans this bit) and the body.
+	// TCP's 16-bit checksum misses real-world corruption on long streams;
+	// zstd frames carry their own CRC but raw chunks — incompressible
+	// data, the common case for media — had no integrity check at all.
+	// Negotiated via FeatChunkSum.
+	ChunkFlagSum uint8 = 1 << 3
 )
 
 const frameChunkType uint8 = 0x20
@@ -143,6 +151,45 @@ func (s *DataStream) ReadChunk() (ChunkHeader, []byte, error) {
 		return ChunkHeader{}, nil, err
 	}
 	return h, payload, nil
+}
+
+// ChunkSum is the frame checksum: crc32c over the frame identity and the
+// body. The Sum flag itself is masked so both sides hash the same bytes.
+func ChunkSum(h ChunkHeader, body []byte) uint32 {
+	var idb [1 + 2*binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(idb[:], uint64(h.FileID))
+	n += binary.PutUvarint(idb[n:], h.ChunkIdx)
+	idb[n] = h.Flags &^ ChunkFlagSum
+	n++
+	c := crc32.Update(0, crc32c, idb[:n])
+	return crc32.Update(c, crc32c, body)
+}
+
+// WriteChunkSummed sends one chunk frame with the crc32c trailer (the
+// negotiated FeatChunkSum path). body may be nil for zero chunks.
+func (s *DataStream) WriteChunkSummed(h ChunkHeader, body []byte) error {
+	h.Flags |= ChunkFlagSum
+	h.PayloadLen = uint64(len(body)) + 4
+	var tr [4]byte
+	binary.LittleEndian.PutUint32(tr[:], ChunkSum(h, body))
+	var hdr [2 + 3*binary.MaxVarintLen64]byte
+	hdr[0] = frameChunkType
+	n := 1
+	n += binary.PutUvarint(hdr[n:], uint64(h.FileID))
+	n += binary.PutUvarint(hdr[n:], h.ChunkIdx)
+	hdr[n] = h.Flags
+	n++
+	n += binary.PutUvarint(hdr[n:], h.PayloadLen)
+	if _, err := s.conn.Write(hdr[:n]); err != nil {
+		return err
+	}
+	if len(body) > 0 {
+		if _, err := s.conn.Write(body); err != nil {
+			return err
+		}
+	}
+	_, err := s.conn.Write(tr[:])
+	return err
 }
 
 // Underlying exposes the wrapped stream (for Close).

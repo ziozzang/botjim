@@ -41,7 +41,9 @@ type SwarmFile struct {
 func (s *SwarmSpec) SpecHash() string {
 	h := sha256.New()
 	for _, f := range s.Files {
-		fmt.Fprintf(h, "%s\x00%d\x00%s\x00", f.Path, f.Size, f.SHA)
+		// Mode is bound in: an unsigned/MITM'd descriptor must not be able
+		// to set e.g. setuid on a file whose content still hashes clean
+		fmt.Fprintf(h, "%s\x00%d\x00%o\x00%s\x00", f.Path, f.Size, f.Mode&0o7777, f.SHA)
 		for _, c := range f.Chunks {
 			fmt.Fprintf(h, "%s\x00", c)
 		}
@@ -77,6 +79,12 @@ func BuildSwarmSpec(ctx context.Context, roots []string, name string) (*SwarmSpe
 			rel := strings.TrimPrefix(strings.TrimPrefix(p, filepath.Dir(root)+string(filepath.Separator)), root)
 			if base == "." {
 				rel = strings.TrimPrefix(p, root+string(filepath.Separator))
+			}
+			if p == root {
+				// the root IS the file: its rel is the basename (the full
+				// path here used to desync the spec from the serve root,
+				// so seeding a single file always answered MISS)
+				rel = filepath.Base(p)
 			}
 			if rel == "" {
 				rel = filepath.Base(p)

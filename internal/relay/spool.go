@@ -51,18 +51,22 @@ func (s *spoolBuf) Write(p []byte) (int, error) {
 	defer s.mu.Unlock()
 	written := 0
 	for len(p) > 0 {
-		for s.buffered >= s.limit && s.err == nil {
-			s.cond.Wait()
+		if s.limit > 0 {
+			for s.buffered >= s.limit && s.err == nil {
+				s.cond.Wait()
+			}
 		}
 		if s.err != nil {
 			return written, s.err
 		}
 		n := len(p)
-		if room := s.limit - s.buffered; room < int64(n) {
-			n = int(room)
+		if s.limit > 0 {
+			if room := s.limit - s.buffered; room < int64(n) {
+				n = int(room)
+			}
 		}
 		if n == 0 {
-			continue // limit 0: reject
+			continue
 		}
 		chunk := p[:n]
 		// spill first if memory is over threshold and disk is available:
@@ -137,7 +141,12 @@ func (s *spoolBuf) Read(p []byte) (int, error) {
 				s.fileRdOff += int64(n)
 				s.buffered -= int64(n)
 				if s.fileRdOff == s.fileWrOff && s.mem.Len() == 0 {
-					s.maybeTruncateLocked()
+					// fully drained: reclaim the spill space NOW, not only
+					// at EOF — otherwise a long stream grows the unlinked
+					// file to the whole transfer size on disk (the live
+					// buffer stays bounded, but delivered bytes below
+					// fileRdOff are never released until the stream ends)
+					s.resetSpillLocked()
 				}
 				s.cond.Broadcast()
 				return n, nil
@@ -200,14 +209,14 @@ func (s *spoolBuf) Finish() {
 	s.mu.Unlock()
 }
 
-// maybeTruncateLocked releases spill-file space once everything is drained.
-func (s *spoolBuf) maybeTruncateLocked() {
-	if s.file != nil && s.fileRdOff == s.fileWrOff && s.mem.Len() == 0 && s.eof {
+// resetSpillLocked releases spill-file space once the file is fully
+// drained (rd==wr, nothing pending in memory). Safe mid-stream: no unread
+// bytes remain in the file, so rewinding both offsets to 0 and truncating
+// keeps FIFO intact and lets the file be reused for the next spill.
+func (s *spoolBuf) resetSpillLocked() {
+	if s.file != nil && s.fileRdOff == s.fileWrOff && s.mem.Len() == 0 {
 		_ = s.file.Truncate(0)
 		s.fileRdOff, s.fileWrOff = 0, 0
-		if _, err := s.file.Seek(0, io.SeekStart); err == nil {
-			// reuse the file for a possible next spill
-		}
 	}
 }
 

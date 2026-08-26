@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ziozzang/botjim/internal/fsutil"
 	"github.com/ziozzang/botjim/internal/session"
 )
 
@@ -20,8 +21,11 @@ import (
 // stdin is spooled to a temp file first so the transfer itself keeps the
 // full engine (delta, resume, verification) rather than a lossy stream.
 func cmdPipe(args []string) int {
-	if len(args) < 1 {
+	if len(args) < 1 || args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
 		pipeUsage()
+		if len(args) >= 1 {
+			return 0
+		}
 		return 3
 	}
 	switch args[0] {
@@ -52,7 +56,12 @@ func pipeSend(args []string) int {
 		"Read stdin fully, then transfer it as remote file NAME.\nSpooled to a temp file first so resume/verification apply.")
 	fs.BoolVar(&stdin, "stdin", true, "read stdin (default; kept for symmetry)")
 	fs.StringVar(&name, "name", "", "remote file name (default: stdin-<timestamp>)")
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		if parseHelp(err) {
+			return 0
+		}
+		return 3
+	}
 	rest := fs.Args()
 	if len(rest) < 1 {
 		fmt.Fprintln(os.Stderr, "error: pipe send needs HOST [NAME] (positional)")
@@ -65,6 +74,11 @@ func pipeSend(args []string) int {
 		} else {
 			name = "stdin-" + tsNow()
 		}
+	}
+	// reject a bad NAME before swallowing all of stdin
+	if err := fsutil.RelOK(filepath.ToSlash(name)); err != nil {
+		fmt.Fprintf(os.Stderr, "error: bad name %q: %v\n", name, err)
+		return 3
 	}
 	tmp, err := os.CreateTemp("", "botjim-pipe-*")
 	if err != nil {
@@ -102,12 +116,26 @@ func pipeSend(args []string) int {
 		}
 		os.Remove(tmpName)
 	}
+	// run from inside the stage and send ".": the manifest's base is the
+	// LCA of the args, so a staged file path would strip the NAME's
+	// directories (dir/name.bin landed as name.bin). Rooted at ".", the
+	// remote path is exactly NAME.
+	wd, _ := os.Getwd()
+	if err := os.Chdir(stage); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 2
+	}
+	defer func() { _ = os.Chdir(wd) }()
+	tok, pass, cloak := endpointSec(host)
 	res := session.RunTransfer(context.Background(), session.ClientConfig{
 		Addr:        endpointAddr(host),
 		Direction:   0,
-		Paths:       []string{dst},
+		Paths:       []string{"."},
 		Compression: 1,
 		Parallel:    2,
+		Token:       tok,
+		Pass:        pass,
+		Cloak:       cloak,
 	})
 	if res.Err != nil {
 		fmt.Fprintln(os.Stderr, "pipe send:", res.Err)
@@ -121,7 +149,12 @@ func pipeSend(args []string) int {
 func pipeCat(args []string) int {
 	fs := newFlagSet("pipe cat", "botjim pipe cat HOST PATH",
 		"Stream one remote file to stdout (spooled via the engine, verified).")
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		if parseHelp(err) {
+			return 0
+		}
+		return 3
+	}
 	rest := fs.Args()
 	if len(rest) < 2 {
 		fmt.Fprintln(os.Stderr, "error: pipe cat needs HOST PATH")
@@ -134,6 +167,7 @@ func pipeCat(args []string) int {
 		return 2
 	}
 	defer os.RemoveAll(tmpDir)
+	tok, pass, cloak := endpointSec(host)
 	res := session.RunTransfer(context.Background(), session.ClientConfig{
 		Addr:        endpointAddr(host),
 		Direction:   1, // pull
@@ -141,12 +175,17 @@ func pipeCat(args []string) int {
 		DestRoot:    tmpDir,
 		Compression: 1,
 		Parallel:    2,
+		Token:       tok,
+		Pass:        pass,
+		Cloak:       cloak,
 	})
 	if res.Err != nil {
 		fmt.Fprintln(os.Stderr, "pipe cat:", res.Err)
 		return 2
 	}
-	local := filepath.Join(tmpDir, path)
+	// a single-file pull lands as its basename in DestRoot (the manifest
+	// base strips the remote directories), so look it up by basename
+	local := filepath.Join(tmpDir, filepath.Base(filepath.FromSlash(path)))
 	f, err := os.Open(local)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -160,14 +199,30 @@ func pipeCat(args []string) int {
 	return 0
 }
 
-// endpointAddr resolves a named endpoint to its address ("" name passes through).
+// endpointAddr resolves a named endpoint to its address ("" name passes
+// through).
 func endpointAddr(host string) string {
-	if cfg := loadConfigQuiet(); cfg != nil {
-		if ep, ok := cfg.ResolveEndpoint(host); ok {
-			return ep.Addr
-		}
+	if ep, ok := resolveEndpoint(host); ok {
+		return ep.Addr
 	}
 	return host
+}
+
+// endpointSec returns the credentials a named endpoint carries (zero
+// SecOpts for a literal host) — pipe talks to authenticated endpoints
+// the same way plain send does.
+func endpointSec(host string) (token, pass, cloak string) {
+	if ep, ok := resolveEndpoint(host); ok {
+		return ep.Token, ep.Pass, ep.Cloak
+	}
+	return "", "", ""
+}
+
+func resolveEndpoint(host string) (Endpoint, bool) {
+	if cfg := loadConfigQuiet(); cfg != nil {
+		return cfg.ResolveEndpoint(host)
+	}
+	return Endpoint{}, false
 }
 
 func tsNow() string {

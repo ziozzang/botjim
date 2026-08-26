@@ -175,17 +175,17 @@ func (r *Registry) AddSkipped(n int64) { r.skippedBytes.Add(uint64(n)) }
 // full, and appends a timestamped line to the persistent log sink.
 func (r *Registry) Emit(kind, path, msg string) {
 	now := time.Now()
-	if r.sink != nil {
-		r.sinkMu.Lock()
-		f := r.sink
-		r.sinkMu.Unlock()
-		f(Event{Kind: kind, Path: path, Msg: msg, At: now})
+	r.sinkMu.Lock()
+	sink := r.sink
+	r.sinkMu.Unlock()
+	if sink != nil {
+		sink(Event{Kind: kind, Path: path, Msg: msg, At: now})
 	}
+	r.logMu.Lock()
 	if r.logW != nil {
-		r.logMu.Lock()
 		fmt.Fprintf(r.logW, "%s %-10s %s %s\n", now.Format(time.RFC3339), kind, path, msg)
-		r.logMu.Unlock()
 	}
+	r.logMu.Unlock()
 	select {
 	case r.Events <- Event{Kind: kind, Path: path, Msg: msg, At: now}:
 	default:

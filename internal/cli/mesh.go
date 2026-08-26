@@ -7,7 +7,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"sync"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/ziozzang/botjim/internal/relay"
 )
@@ -19,6 +23,25 @@ func configPathEnv() string {
 		return p
 	}
 	return ConfigPath()
+}
+
+// lockConfig takes an exclusive cross-process lock guarding config
+// read-modify-write cycles (meshApplyMu only covers this process; two
+// servers or a server plus `config publish` on one config would
+// otherwise silently lose updates). Returns an unlock func.
+func lockConfig(cfgPath string) (func(), error) {
+	lf, err := os.OpenFile(cfgPath+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Flock(int(lf.Fd()), unix.LOCK_EX); err != nil {
+		lf.Close()
+		return nil, err
+	}
+	return func() {
+		_ = unix.Flock(int(lf.Fd()), unix.LOCK_UN)
+		_ = lf.Close()
+	}, nil
 }
 
 // saveConfig writes the config atomically (tmp + rename).
@@ -103,11 +126,18 @@ func (m *meshEnvelope) unsignedBody() []byte {
 	return b
 }
 
+// meshApplyMu serializes envelope application: the commit hook can fire
+// from several concurrent session finalizers, and an interleaved
+// read-modify-write of the config could regress the recorded version.
+var meshApplyMu sync.Mutex
+
 // applyMeshEnvelope reads the envelope at path, checks it against the
 // pinned mesh key and version in the local config, and merges it in.
 // Every check fails closed: unsigned, wrong key, stale version or
 // tampered bytes leave the config untouched.
 func applyMeshEnvelope(envelopePath string) error {
+	meshApplyMu.Lock()
+	defer meshApplyMu.Unlock()
 	raw, err := os.ReadFile(envelopePath)
 	if err != nil {
 		return err
@@ -117,6 +147,11 @@ func applyMeshEnvelope(envelopePath string) error {
 		return fmt.Errorf("mesh envelope: bad JSON: %w", err)
 	}
 	cfgPath := configPathEnv()
+	unlock, err := lockConfig(cfgPath)
+	if err != nil {
+		return fmt.Errorf("mesh envelope: lock: %w", err)
+	}
+	defer unlock()
 	cfg, err := LoadConfig(cfgPath)
 	if err != nil {
 		return fmt.Errorf("mesh envelope: config: %w", err)
@@ -127,19 +162,40 @@ func applyMeshEnvelope(envelopePath string) error {
 	if env.PubKey != cfg.Mesh.Key {
 		return fmt.Errorf("mesh envelope: signed by an unpinned key (%.16s…)", env.PubKey)
 	}
+	if env.Version == cfg.Mesh.Version && ed25519VerifyHex(env.PubKey, env.unsignedBody(), env.Sig) {
+		return errMeshCurrent // re-delivery of the applied version: quiet no-op
+	}
 	if env.Version <= cfg.Mesh.Version {
 		return fmt.Errorf("mesh envelope: stale (v%d ≤ local v%d)", env.Version, cfg.Mesh.Version)
 	}
 	if !ed25519VerifyHex(env.PubKey, env.unsignedBody(), env.Sig) {
 		return fmt.Errorf("mesh envelope: signature verification failed")
 	}
-	// merge: envelope wins per name, node-local endpoints survive
+	// bootstrap replay guard: a freshly-pinned node (version 0) would
+	// accept ANY old signed envelope — bound its age (TS is signed)
+	if cfg.Mesh.Version == 0 {
+		if ts, terr := time.Parse(time.RFC3339, env.TS); terr != nil || time.Since(ts) > 30*24*time.Hour {
+			return fmt.Errorf("mesh envelope: refusing bootstrap from an envelope older than 30 days (ts %q) — republish on the key owner's node", env.TS)
+		}
+	}
+	// merge: envelope wins per name, node-local endpoints survive; names
+	// the mesh managed before that are ABSENT now were deleted on the
+	// publisher — drop them here too, or revoked endpoints live forever
 	if cfg.Endpoints == nil {
 		cfg.Endpoints = map[string]Endpoint{}
 	}
+	for _, name := range cfg.Mesh.Managed {
+		if _, still := env.Endpoints[name]; !still {
+			delete(cfg.Endpoints, name)
+		}
+	}
+	managed := make([]string, 0, len(env.Endpoints))
 	for name, ep := range env.Endpoints {
 		cfg.Endpoints[name] = ep
+		managed = append(managed, name)
 	}
+	sort.Strings(managed)
+	cfg.Mesh.Managed = managed
 	cfg.Mesh.Version = env.Version
 	cfg.Mesh.Origin = env.Origin
 	if err := saveConfig(cfgPath, cfg); err != nil {
@@ -148,23 +204,41 @@ func applyMeshEnvelope(envelopePath string) error {
 	return nil
 }
 
-// meshOnCommit returns the server-side commit hook when the local
-// config pins a mesh key (nil otherwise).
+// errMeshCurrent marks a benign re-delivery of the already-applied
+// envelope version (sync --watch re-pushes are routine).
+var errMeshCurrent = fmt.Errorf("mesh envelope already applied")
+
+// meshOnCommit returns the server-side commit hook. It is always
+// installed (a key pinned after server start must work without a
+// restart); applyMeshEnvelope fails closed per call when no key is
+// pinned yet.
 func meshOnCommit(root string) func(rel string) {
-	cfg := loadConfigQuiet()
-	if cfg.Mesh == nil || cfg.Mesh.Key == "" {
-		return nil
-	}
 	return func(rel string) {
 		if rel != MeshEnvelopeName {
 			return
 		}
-		if err := applyMeshEnvelope(filepath.Join(root, rel)); err != nil {
+		path := filepath.Join(root, rel)
+		err := applyMeshEnvelope(path)
+		// the envelope carries every endpoint's token/pass: never leave
+		// it in the jail where any client with this server's token could
+		// pull it — one leaked token must not compromise the whole mesh
+		if cfg := loadConfigQuiet(); cfg.Mesh != nil && cfg.Mesh.Key != "" {
+			_ = os.Remove(path)
+		}
+		if err != nil {
+			if err == errMeshCurrent {
+				return // routine re-push of the applied version
+			}
 			fmt.Fprintf(os.Stderr, "mesh config rejected: %v\n", err)
 			return
 		}
-		cfg, _ := LoadConfig(configPathEnv())
-		fmt.Fprintf(os.Stderr, "mesh config updated to v%d from %s\n", cfg.Mesh.Version, cfg.Mesh.Origin)
+		after, lerr := LoadConfig(configPathEnv())
+		if lerr != nil || after.Mesh == nil {
+			// never panic the server from a commit hook
+			fmt.Fprintf(os.Stderr, "mesh config applied (could not re-read: %v)\n", lerr)
+			return
+		}
+		fmt.Fprintf(os.Stderr, "mesh config updated to v%d from %s\n", after.Mesh.Version, after.Mesh.Origin)
 	}
 }
 
@@ -199,10 +273,41 @@ func cmdConfigPublish(args []string) int {
 	if cfg.Mesh == nil {
 		cfg.Mesh = &MeshConfig{}
 	}
-	priv, err := relay.LoadOrCreateEd25519Key(keyPath)
+	unlock, err := lockConfig(cfgPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 2
+	}
+	defer unlock()
+	// re-read under the lock: a server applying an envelope concurrently
+	// may have bumped the version between our load and here
+	if fresh, ferr := LoadConfig(cfgPath); ferr == nil {
+		cfg = fresh
+		if cfg.Mesh == nil {
+			cfg.Mesh = &MeshConfig{}
+		}
+	}
+	var priv ed25519.PrivateKey
+	if cfg.Mesh.Key != "" {
+		// pinned: never mint a new key here — load only
+		priv, err = relay.LoadSwarmKey(keyPath)
+	} else {
+		priv, err = relay.LoadOrCreateEd25519Key(keyPath)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 2
+	}
+	// this node may be a SUBSCRIBER: publishing with a different key
+	// would ship an envelope every pinned node (this one included)
+	// rejects, while bumping the local version and blocking the next
+	// legitimate envelope. Refuse unless the keys match.
+	if cfg.Mesh != nil && cfg.Mesh.Key != "" {
+		if pub := ed25519PubHex(priv); pub != cfg.Mesh.Key {
+			fmt.Fprintln(os.Stderr, "error: this config pins a different mesh key than the signing key")
+			fmt.Fprintf(os.Stderr, "pinned:   %.16s…\nsigning:  %.16s…\npublish from the key owner's node, or point --key at the pinned key\n", cfg.Mesh.Key, pub)
+			return 3
+		}
 	}
 	origin, _ := os.Hostname()
 	if origin == "" {
@@ -222,18 +327,22 @@ func cmdConfigPublish(args []string) int {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 2
 	}
-	if err := os.WriteFile(out, append(b, '\n'), 0o600); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 2
-	}
-	// remember our own version so we accept our own (and later) updates
+	// record the version BEFORE the envelope exists anywhere: a crash
+	// between the two wastes one version number (harmless), while the
+	// old order could emit two different envelopes with the SAME version
+	// — permanent split-brain, every node rejecting the one it missed
 	cfg.Mesh.Version = env.Version
 	cfg.Mesh.Origin = origin
 	if cfg.Mesh.Key == "" {
 		cfg.Mesh.Key = pub
 	}
 	if err := saveConfig(cfgPath, cfg); err != nil {
-		fmt.Fprintln(os.Stderr, "warning: could not record mesh version:", err)
+		fmt.Fprintln(os.Stderr, "error: could not record mesh version (refusing to emit the envelope):", err)
+		return 2
+	}
+	if err := os.WriteFile(out, append(b, '\n'), 0o600); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 2
 	}
 	fmt.Fprintf(os.Stderr, "envelope: %s (v%d, %d endpoints, origin %s)\n", out, env.Version, len(env.Endpoints), env.Origin)
 	fmt.Fprintf(os.Stderr, "mesh key: %s\nsync-push it (e.g. into a --watch dir); nodes pin it via mesh.key\n", pub)

@@ -45,6 +45,9 @@ func cmdServer(args []string) int {
 		fmt.Fprintln(os.Stderr, "error: server takes no positional arguments")
 		return 3
 	}
+	// config defaults first: map_owners from config must reach the
+	// policy check, not be validated away as the flag default "none"
+	applyConfigFromDefaults(f, args)
 	if f.parallel < 1 || f.parallel > 64 {
 		fmt.Fprintln(os.Stderr, "error: --parallel must be 1..64")
 		return 3
@@ -55,7 +58,6 @@ func cmdServer(args []string) int {
 		return 3
 	}
 
-	applyConfigFromDefaults(f, args)
 	ctx := signalContext()
 	if err := runServer(ctx, f, owners); err != nil {
 		fmt.Fprintln(os.Stderr, "server error:", err)

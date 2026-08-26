@@ -23,7 +23,10 @@ import (
 // (mtime+size per file) so a sweep only pushes when something actually
 // differs.
 func watchLoop(ctx context.Context, dir string, quiet, sweep time.Duration, push func() error) error {
-	// first push immediately
+	// snapshot BEFORE the first push: a change landing mid-push differs
+	// from this baseline and triggers a (delta, cheap) re-push — take it
+	// after and the change is silently part of the baseline forever
+	lastSnap := snapshot(dir)
 	if err := push(); err != nil {
 		fmt.Fprintf(os.Stderr, "sync: %v (retrying on next change)\n", err)
 	}
@@ -35,7 +38,6 @@ func watchLoop(ctx context.Context, dir string, quiet, sweep time.Duration, push
 	if err := addTree(w, dir); err != nil {
 		return fmt.Errorf("watch %s: %w", dir, err)
 	}
-	lastSnap := snapshot(dir)
 
 	var (
 		quietTimer = time.NewTimer(quiet)
@@ -74,13 +76,15 @@ func watchLoop(ctx context.Context, dir string, quiet, sweep time.Duration, push
 			fmt.Fprintf(os.Stderr, "watch: %v\n", err)
 
 		case <-quietTimer.C:
+			// disarm: the timer re-arms on the next event. Resetting it
+			// here would take a full snapshot every debounce interval,
+			// forever, on an idle tree; the sweep timer is the safety net.
 			quietArmed = false
 			snap := snapshot(dir)
 			if snap != lastSnap {
 				lastSnap = snap
 				runWatchedPush(push)
 			}
-			quietTimer.Reset(quiet)
 
 		case <-sweepTimer.C:
 			sweepTimer.Reset(sweep)

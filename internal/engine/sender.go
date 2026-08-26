@@ -48,6 +48,8 @@ type Sender struct {
 	dirs          uint64
 	hasHardlinks  bool
 
+	chunkSum bool // peer negotiated FeatChunkSum: sum every data frame
+
 	taskCh  chan chunkTask
 	reqCh   chan chunkTask // request-driven tasks (fanout/swarm source)
 	manHash hash.Hash      // running manifest digest (sender side)
@@ -107,6 +109,9 @@ func NewSender(sess *transport.Session, ctrl *protocol.CtrlStream, opts Options,
 		ctrlDone:    make(chan struct{}),
 	}
 	s.gateCond = sync.NewCond(&s.mu)
+	if sess != nil && sess.HS != nil {
+		s.chunkSum = sess.HS.FeatureBits&protocol.FeatChunkSum != 0
+	}
 	if opts.LimitBPS > 0 {
 		s.limiter = newLimiter(opts.LimitBPS)
 	}
@@ -253,7 +258,19 @@ func (s *Sender) Run(ctx context.Context) (Report, error) {
 	s.report.Bytes = s.reg.SentBytes()
 	cancelled := s.report.Cancelled
 	completed := s.resolved >= files && files > 0
+	// close every source fd still open: unresolved files (cancelled or
+	// stalled runs) would otherwise leak fds for the life of a server
+	var leftover []*os.File
+	for _, f := range s.files {
+		if f.fd != nil {
+			leftover = append(leftover, f.fd)
+			f.fd = nil
+		}
+	}
 	s.mu.Unlock()
+	for _, fd := range leftover {
+		_ = fd.Close()
+	}
 	if perr := s.remoteErr.Load(); perr != nil {
 		return s.report, *perr
 	}
@@ -425,6 +442,17 @@ func (s *Sender) readCtrl(ctx context.Context, cancel context.CancelFunc) {
 				cancel()
 				return
 			}
+			// hold an in-flight reference for the fd lifetime guard:
+			// without it taskDone would decrement a count this request
+			// never incremented and the fd could close mid-read
+			s.mu.Lock()
+			if f := s.files[m.FileID]; f == nil || f.errored {
+				s.mu.Unlock()
+				break
+			} else {
+				f.inflight++
+			}
+			s.mu.Unlock()
 			select {
 			case s.reqCh <- chunkTask{fileID: m.FileID, idx: int64(m.ChunkIdx)}:
 			case <-ctx.Done():
@@ -467,6 +495,12 @@ func (s *Sender) gateOpen(m protocol.HaveBitmap) {
 		s.mu.Unlock()
 		return
 	}
+	if f.have != nil || f.allSkip {
+		// a bitmap was already processed for this file: a duplicate would
+		// double-release credit and race verifyClaims on f.have
+		s.mu.Unlock()
+		return
+	}
 	waiting := f.have == nil && !f.allSkip
 	haveCount := int64(0)
 	switch m.Status {
@@ -483,14 +517,32 @@ func (s *Sender) gateOpen(m protocol.HaveBitmap) {
 		}
 		if len(m.Hashes) > 0 {
 			// untrusted claim (delta adoption): verify each claimed chunk
-			// against our own bytes, clear the mismatches
+			// against our own bytes, clear the mismatches. The rehash is
+			// whole-file IO — drop s.mu for it (f.have is already
+			// installed so the credit below releases exactly once, and
+			// the file is not in readyQ yet, so only we touch the bits)
+			if waiting {
+				s.gatesOpen--
+				s.gateCond.Signal()
+				waiting = false
+			}
+			s.mu.Unlock()
 			cleared := s.verifyClaims(f, m.Hashes)
-			haveCount -= cleared
 			if cleared == 0 {
 				// every claim verified: nothing will arrive, tell the
 				// receiver to finalize the adopted file
 				_ = s.ctrl.Send(protocol.MsgCommit, 0, protocol.Commit{FileID: m.FileID}.Encode())
+			} else {
+				// some claims failed: send the verified bitmap so the
+				// receiver knows which chunks are still in flight and
+				// does not finalize on its own optimistic claims (that
+				// early-finalize dropped late corrections and left stale
+				// chunks in the final file)
+				_ = s.ctrl.Send(protocol.MsgClaimResult, 0,
+					protocol.ClaimResult{FileID: m.FileID, Verified: append([]byte(nil), f.have...)}.Encode())
 			}
+			s.mu.Lock()
+			haveCount -= cleared
 		}
 	case protocol.HaveNone:
 		f.have = []byte{}
@@ -531,7 +583,17 @@ func (s *Sender) verifyClaims(f *txFile, hashes [][32]byte) int64 {
 	e := f.entry
 	fd, err := fsutil.OpenNoAtime(e.AbsPath)
 	if err != nil {
-		return 0 // cannot verify: trust nothing, clear all
+		// cannot verify: trust NOTHING — clear every claimed bit so the
+		// receiver gets a ClaimResult (not a Commit) and nothing stale is
+		// finalized. Returning 0 here meant "all verified" → false Commit.
+		cleared := int64(0)
+		for i := int64(0); i < grid.Count(); i++ {
+			if bitTest(f.have, i) {
+				clearBit(f.have, i)
+				cleared++
+			}
+		}
+		return cleared
 	}
 	defer fd.Close()
 	buf := make([]byte, grid.ChunkSize)
@@ -911,7 +973,11 @@ func (s *Sender) sendChunk(ctx context.Context, ds *protocol.DataStream, codec c
 		if err := s.limiter.acquire(ctx, n); err != nil {
 			return err
 		}
-		return ds.WriteChunk(protocol.ChunkHeader{FileID: e.ID, ChunkIdx: uint64(task.idx), Flags: protocol.ChunkFlagZero, PayloadLen: 0}, nil)
+		zh := protocol.ChunkHeader{FileID: e.ID, ChunkIdx: uint64(task.idx), Flags: protocol.ChunkFlagZero}
+		if s.chunkSum {
+			return ds.WriteChunkSummed(zh, nil)
+		}
+		return ds.WriteChunk(zh, nil)
 	}
 	if codec != nil {
 		out, wasRaw := codec.Compress(*zbufp, raw)
@@ -932,7 +998,11 @@ func (s *Sender) sendChunk(ctx context.Context, ds *protocol.DataStream, codec c
 	if err := s.limiter.acquire(ctx, n); err != nil {
 		return err
 	}
-	return ds.WriteChunk(protocol.ChunkHeader{FileID: e.ID, ChunkIdx: uint64(task.idx), Flags: flags, PayloadLen: uint64(len(payload))}, payload)
+	dh := protocol.ChunkHeader{FileID: e.ID, ChunkIdx: uint64(task.idx), Flags: flags, PayloadLen: uint64(len(payload))}
+	if s.chunkSum {
+		return ds.WriteChunkSummed(dh, payload)
+	}
+	return ds.WriteChunk(dh, payload)
 }
 
 func isCtxErr(err error) bool {
@@ -943,6 +1013,10 @@ func isCtxErr(err error) bool {
 }
 
 // taskDone drops one in-flight reference and closes the fd when resolved.
+// When the last chunk of a file has gone out it also re-checks the source:
+// a file rewritten mid-transfer yields chunks from mixed versions, which
+// each pass their own read but assemble into garbage — flag it instead of
+// reporting success.
 func (s *Sender) taskDone(fileID uint32) {
 	s.mu.Lock()
 	f := s.files[fileID]
@@ -958,9 +1032,22 @@ func (s *Sender) taskDone(fileID uint32) {
 		fd = f.fd
 		f.fd = nil
 	}
+	checkFd := (*os.File)(nil)
+	if f.fd != nil && !f.resolved && !f.errored && f.inflight == 0 && f.nextTask >= f.count {
+		checkFd = f.fd
+	}
 	s.mu.Unlock()
 	if fd != nil {
 		_ = fd.Close()
+		return
+	}
+	if checkFd != nil {
+		e := f.entry
+		if fi, err := checkFd.Stat(); err == nil {
+			if fi.Size() != e.Size || !fi.ModTime().Equal(time.Unix(e.Mtime.Sec, int64(e.Mtime.Nsec))) {
+				s.failFile(f, CodeSourceChanged, "source changed during transfer (re-run to converge)")
+			}
+		}
 	}
 }
 

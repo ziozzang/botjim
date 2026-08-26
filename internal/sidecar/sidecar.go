@@ -261,7 +261,23 @@ func (s *Sidecar) SaveAtomic(partPath string) error {
 	if err != nil {
 		return err
 	}
-	meta := MetaPathForPart(partPath)
+	return s.saveAtomicMeta(MetaPathForPart(partPath), b)
+}
+
+// SaveAtomicMeta writes the sidecar to an explicit meta path (delta
+// adoption, whose part path IS the final file, needs this — deriving the
+// meta path from that would collide with a real sibling file).
+func (s *Sidecar) SaveAtomicMeta(metaPath string) error {
+	s.Updated = time.Now()
+	s.HaveB64 = base64.StdEncoding.EncodeToString(s.have)
+	b, err := json.Marshal(s)
+	if err != nil {
+		return err
+	}
+	return s.saveAtomicMeta(metaPath, b)
+}
+
+func (s *Sidecar) saveAtomicMeta(meta string, b []byte) error {
 	tmp := meta + ".tmp"
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err

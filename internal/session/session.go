@@ -180,6 +180,9 @@ func (s *Server) handleConn(raw net.Conn) {
 	// cloak demux: HTTP-looking connections upgrade inside ServeCloak;
 	// plain FSY1 bytes go straight through
 	if s.cfg.Cloak != "" && transport.CloakServe != nil {
+		// the sniff blocks until 4 bytes arrive: bound it, or an idle
+		// connection parks this goroutine forever
+		_ = raw.SetReadDeadline(time.Now().Add(15 * time.Second))
 		br := bufio.NewReader(raw)
 		if transport.CloakSniff(br) {
 			wrapped := transport.CloakServe(raw, br, s.cfg.Cloak)
@@ -187,7 +190,12 @@ func (s *Server) handleConn(raw net.Conn) {
 				return // decoy answered; not our session
 			}
 			raw = wrapped
+		} else if transport.CloakPlain != nil {
+			// not HTTP: replay the sniffed bytes to the plain path —
+			// they live in br's buffer now, not on the socket
+			raw = transport.CloakPlain(raw, br)
 		}
+		_ = raw.SetReadDeadline(time.Time{}) // AcceptSec sets its own
 	}
 	sess, err := transport.AcceptSec(raw, s.cfg.Features, nil, transport.SecOpts{Token: s.cfg.Token, Pass: s.cfg.Pass})
 	if err != nil {

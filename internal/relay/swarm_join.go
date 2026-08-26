@@ -48,10 +48,42 @@ type Joiner struct {
 
 	mu       sync.Mutex
 	rr       atomic.Int64        // round-robin cursor for peer rotation
+	curPeers []Peer              // live member list, refreshed by re-announce
 	parts    map[string]*os.File // rel path → part fd (lazy init)
 	verified map[string]bool     // rel path → passed whole-file SHA
 	banned   map[string]bool     // peer addr → served a bad chunk
 	serveLn  net.Listener
+}
+
+func (j *Joiner) setPeers(p []Peer) {
+	j.mu.Lock()
+	j.curPeers = p
+	j.mu.Unlock()
+}
+
+func (j *Joiner) peersSnapshot() []Peer {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	out := make([]Peer, len(j.curPeers))
+	copy(out, j.curPeers)
+	return out
+}
+
+// reannounceLoop refreshes the joiner's tracker TTL every announceEvery
+// and merges any newly-joined peers into the live set, so a multi-minute
+// download neither expires from its room nor stays blind to later peers.
+func (j *Joiner) reannounceLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(announceEvery):
+		}
+		peers := j.announce(ctx, j.catalog())
+		if len(peers) > 0 {
+			j.setPeers(peers)
+		}
+	}
 }
 
 // banPeer removes a peer that served bytes failing the chunk hash from
@@ -73,11 +105,15 @@ func (j *Joiner) isBanned(addr string) bool {
 	return j.banned[addr]
 }
 
-// chunkOK verifies fetched bytes against the v2 chunk catalog (true when
-// the spec carries no catalog — v1 specs verify at finalize).
+// chunkOK verifies fetched bytes against the v2 chunk catalog. No
+// catalog at all (v1 spec) defers to finalize-time verification; a
+// catalog that does not cover this chunk is corrupt and fails closed.
 func chunkOK(f SwarmFile, ci int64, data []byte) bool {
-	if ci >= int64(len(f.Chunks)) || len(f.Chunks) == 0 {
-		return true
+	if len(f.Chunks) == 0 {
+		return true // v1: no catalog, finalize verifies the whole file
+	}
+	if ci < 0 || ci >= int64(len(f.Chunks)) {
+		return false // catalog does not cover the grid — corrupt spec
 	}
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:]) == f.Chunks[ci]
@@ -100,10 +136,28 @@ func (j *Joiner) Run(ctx context.Context) error {
 			return err
 		}
 	}
-	peers := j.announce(ctx, j.catalog())
+	// initial announce: a cold-start race (joiner announces before the
+	// seed's first announce lands) must not be fatal — retry a few cycles
+	var peers []Peer
+	for attempt := 0; attempt < 6; attempt++ {
+		peers = j.announce(ctx, j.catalog())
+		if len(peers) > 0 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
 	if len(peers) == 0 {
 		return fmt.Errorf("swarm: no peers for this token (is the seed running?)")
 	}
+	j.setPeers(peers)
+	// keep refreshing our TTL in the room AND discover peers that joined
+	// after us — without this the tracker expires us after peerTTL and our
+	// captured peer list never grows
+	go j.reannounceLoop(ctx)
 
 	// build the chunk task list: (fileIdx, chunkIdx) for everything the
 	// local catalog does not hold, then order rarest-first (fewest peers
@@ -126,6 +180,8 @@ func (j *Joiner) Run(ctx context.Context) error {
 	}
 
 	// fetch workers over a shared task queue
+	fctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	taskCh := make(chan chunkTask, 64)
 	var wg sync.WaitGroup
 	var errOnce sync.Once
@@ -139,18 +195,18 @@ func (j *Joiner) Run(ctx context.Context) error {
 		go func() {
 			defer wg.Done()
 			for t := range taskCh {
-				if ctx.Err() != nil {
+				if fctx.Err() != nil {
 					continue
 				}
 				f := j.Spec.Files[t.file]
 				grid := chunking.Grid{Size: f.Size, ChunkSize: chunking.ChunkSizeFor(f.Size)}
-				data, err := j.fetchWithRetry(ctx, peers, f, t.file, t.chunk)
+				data, err := j.fetchWithRetry(fctx, j.peersSnapshot(), f, t.file, t.chunk)
 				if err != nil {
-					errOnce.Do(func() { fatal = fmt.Errorf("%s chunk %d: %w", f.Path, t.chunk, err) })
+					errOnce.Do(func() { fatal = fmt.Errorf("%s chunk %d: %w", f.Path, t.chunk, err); cancel() })
 					continue
 				}
 				if err := j.writeChunk(f, grid, t.chunk, data); err != nil {
-					errOnce.Do(func() { fatal = fmt.Errorf("%s chunk %d: %w", f.Path, t.chunk, err) })
+					errOnce.Do(func() { fatal = fmt.Errorf("%s chunk %d: %w", f.Path, t.chunk, err); cancel() })
 					continue
 				}
 				j.mu.Lock()
@@ -166,7 +222,7 @@ func (j *Joiner) Run(ctx context.Context) error {
 	for _, t := range tasks {
 		select {
 		case taskCh <- t:
-		case <-ctx.Done():
+		case <-fctx.Done():
 		}
 	}
 	close(taskCh)
@@ -260,8 +316,15 @@ func httpFetchChunk(ctx context.Context, base string, f SwarmFile, grid chunking
 	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("http %s for %s", resp.Status, url)
 	}
-	if resp.StatusCode == http.StatusOK && resp.ContentLength >= 0 && resp.ContentLength != n {
-		return nil, fmt.Errorf("http: full-body response of %d bytes (host ignores Range); expected chunk of %d", resp.ContentLength, n)
+	// a 200 (not 206) means the host may have ignored Range and be sending
+	// the WHOLE file. Only a 206, or a 200 whose Content-Length exactly
+	// equals the chunk, is trustworthy — a chunked/unknown-length 200
+	// (ContentLength < 0) would otherwise feed the file's first n bytes as
+	// every chunk, silently corrupting v1 specs that verify only at finalize
+	if resp.StatusCode == http.StatusOK {
+		if resp.ContentLength < 0 || resp.ContentLength != n {
+			return nil, fmt.Errorf("http: host ignored Range (200, length %d; expected a 206 chunk of %d)", resp.ContentLength, n)
+		}
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, n))
 	if err != nil {
@@ -336,22 +399,24 @@ func (j *Joiner) writeChunk(f SwarmFile, grid chunking.Grid, ci int64, data []by
 	}
 	j.mu.Lock()
 	pf, ok := j.parts[f.Path]
-	j.mu.Unlock()
 	if !ok {
+		// open under the lock: two workers racing here would both open
+		// the part and leak one fd
 		part := j.partPath(f.Path)
 		if err := os.MkdirAll(filepath.Dir(part), 0o755); err != nil {
+			j.mu.Unlock()
 			return err
 		}
 		var err error
 		pf, err = os.OpenFile(part, os.O_RDWR|os.O_CREATE, 0o600)
 		if err != nil {
+			j.mu.Unlock()
 			return err
 		}
 		_ = pf.Truncate(f.Size)
-		j.mu.Lock()
 		j.parts[f.Path] = pf
-		j.mu.Unlock()
 	}
+	j.mu.Unlock()
 	_, err := pf.WriteAt(data, grid.Offset(ci))
 	return err
 }
@@ -387,7 +452,7 @@ func (j *Joiner) finalize(f SwarmFile) error {
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		return err
 	}
-	if err := os.Chmod(part, os.FileMode(f.Mode)); err != nil {
+	if err := os.Chmod(part, os.FileMode(f.Mode)&0o777); err != nil {
 		return err
 	}
 	if err := os.Rename(part, abs); err != nil {

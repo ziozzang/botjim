@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/ziozzang/botjim/internal/relay"
@@ -138,12 +137,20 @@ func swarmSeed(args []string) int {
 	fmt.Fprintf(os.Stderr, "code:    %s\n", relay.FormatCode(token))
 	fmt.Fprintf(os.Stderr, "spec:    %s\n", descPath)
 	if desc.Signed() {
-		fmt.Fprintf(os.Stderr, "signed:  %s…\n", desc.PubKey[:24])
+		fmt.Fprintf(os.Stderr, "signed:  %s…\n", truncStr(desc.PubKey, 24))
 		fmt.Fprintln(os.Stderr, "         (joiners pin it with --verify-key)")
 	}
 
-	// serve chunks (root = the common ancestor of the paths)
-	root := filepath.Dir(roots[0])
+	// serve chunks: the spec's rel paths are relative to a DIRECTORY root
+	// itself (its contents), and to the parent for a FILE root — the serve
+	// root must match or every GET answers MISS
+	root := roots[0]
+	if fi, err := os.Stat(roots[0]); err != nil || !fi.IsDir() {
+		root = filepath.Dir(roots[0])
+	}
+	if len(roots) > 1 {
+		fmt.Fprintln(os.Stderr, "note: multiple roots — chunks are served relative to the first; keep them side by side")
+	}
 	bind := fmt.Sprintf(":%d", port)
 	ln, err := transport.Listen(bind)
 	if err != nil {
@@ -168,7 +175,7 @@ func swarmSeed(args []string) int {
 }
 
 func announceLoop(ctx context.Context, tracker, token string, spec *relay.SwarmSpec, self string) {
-	roomHave := strings.Repeat("ff", len(spec.Files))
+	roomHave := relay.SeedCatalog(spec)
 	for {
 		if ctx.Err() != nil {
 			return
@@ -234,7 +241,7 @@ func swarmJoin(args []string) int {
 		return 2
 	}
 	if desc.Signed() && verifyKey == "" {
-		fmt.Fprintf(os.Stderr, "note: spec is signed by %s… (pin it with --verify-key for closed-loop trust)\n", desc.PubKey[:16])
+		fmt.Fprintf(os.Stderr, "note: spec is signed by %s… (pin it with --verify-key for closed-loop trust)\n", truncStr(desc.PubKey, 16))
 	}
 	// the descriptor embeds every file's size and hash — the joiner
 	// needs nothing beside it

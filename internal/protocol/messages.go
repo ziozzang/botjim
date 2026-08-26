@@ -552,6 +552,34 @@ func DecodeCommit(p []byte) (Commit, error) {
 	return m, d.err
 }
 
+// ClaimResult answers an untrusted delta claim (HaveBitmap with hashes)
+// when some claims failed verification: Verified is the sender's post-
+// verification have bitmap. Chunks the receiver claimed that are absent
+// here WILL arrive as data — the receiver must not finalize before they
+// do. (A fully-verified claim is answered with Commit instead.)
+type ClaimResult struct {
+	FileID   uint32
+	Verified []byte
+}
+
+// Encode serializes m.
+func (m ClaimResult) Encode() []byte {
+	var e enc
+	e.uv(uint64(m.FileID))
+	e.bytes(m.Verified)
+	return e.b
+}
+
+// DecodeClaimResult parses a ClaimResult payload.
+func DecodeClaimResult(p []byte) (ClaimResult, error) {
+	var d dec
+	d.b = p
+	var m ClaimResult
+	m.FileID = uint32(d.uv())
+	m.Verified = d.bytes()
+	return m, d.err
+}
+
 // ChunkRequest asks a source to send one chunk on the next data stream
 // frame — receiver-driven acquisition, the mesh/swarm primitive. The
 // sender role answers; the push scheduler never sends these.

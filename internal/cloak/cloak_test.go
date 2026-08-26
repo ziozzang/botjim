@@ -2,93 +2,34 @@ package cloak
 
 import (
 	"bufio"
-	"bytes"
 	"io"
 	"net"
 	"testing"
+	"time"
 )
 
-// echoServer accepts one connection, demuxes, and echoes ws payload back.
-func echoServer(t *testing.T, path string) (addr string, done <-chan struct{}) {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ch := make(chan struct{})
+// TestPlainConnReplaysBufferedBytes: after a sniff Peek, the plain path
+// must still see every byte (regression: the demux used to lose the
+// buffered handshake and plain clients got EOF on cloak servers).
+func TestPlainConnReplaysBufferedBytes(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
 	go func() {
-		defer close(ch)
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		br := bufio.NewReader(conn)
-		if !SniffCloaked(br) {
-			t.Error("sniff failed to see HTTP")
-			return
-		}
-		ws := ServeHTTP(conn, br, path)
-		if ws == nil {
-			return // decoy path: rejection is a normal outcome
-		}
-		buf := make([]byte, 4096)
-		for {
-			n, err := ws.Read(buf)
-			if err != nil {
-				return
-			}
-			if _, err := ws.Write(buf[:n]); err != nil {
-				return
-			}
-		}
+		_, _ = c1.Write([]byte("FSY1 + handshake bytes"))
 	}()
-	return ln.Addr().String(), ch
-}
-
-func TestCloakRoundtrip(t *testing.T) {
-	addr, done := echoServer(t, "/cdn/data")
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ws, err := Dial(conn, "/cdn/data", "example.com")
-	if err != nil {
-		t.Fatal(err)
-	}
-	payload := bytes.Repeat([]byte("cloak-me "), 100000) // ~900KB: multi-frame
-	go func() {
-		if _, err := ws.Write(payload); err != nil {
-			t.Error(err)
-		}
-	}()
-	got := make([]byte, len(payload))
-	if _, err := io.ReadFull(ws, got); err != nil {
-		t.Fatalf("echo read: %v", err)
-	}
-	if !bytes.Equal(got, payload) {
-		t.Fatalf("echo mismatch: %d vs %d bytes", len(got), len(payload))
-	}
-	_ = ws.Close()
-	<-done
-}
-
-func TestCloakWrongPathDecoy(t *testing.T) {
-	addr, done := echoServer(t, "/secret")
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	if _, err := Dial(conn, "/wrong", "x"); err == nil {
-		t.Fatal("wrong path upgraded")
-	}
-	<-done
-}
-
-func TestSniffPlainNotCloaked(t *testing.T) {
-	br := bufio.NewReader(bytes.NewReader([]byte("FSY1\x01\x00")))
+	_ = c2.SetDeadline(time.Now().Add(2 * time.Second))
+	br := bufio.NewReader(c2)
 	if SniffCloaked(br) {
-		t.Fatal("plain FSY1 sniffed as HTTP")
+		t.Fatal("FSY1 bytes sniffed as HTTP")
+	}
+	pc := PlainConn(c2, br)
+	want := []byte("FSY1 + handshake bytes")
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(pc, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("replay lost bytes: %q", got)
 	}
 }

@@ -34,6 +34,21 @@ const decoyPage = `<!DOCTYPE html>
 <html><head><title>Content Delivery Node</title></head>
 <body><h1>It works.</h1><p>This node serves cached assets. Nothing to see here.</p></body></html>`
 
+// PlainConn rewires a connection whose first bytes were buffered during
+// sniffing: reads replay the buffer before hitting the socket again.
+// Without this, a non-HTTP (plain FSY1) client's handshake bytes stay in
+// the bufio.Reader and the demux path sees an empty stream.
+func PlainConn(conn net.Conn, br *bufio.Reader) net.Conn {
+	return &bufConn{Conn: conn, r: br}
+}
+
+type bufConn struct {
+	net.Conn
+	r io.Reader
+}
+
+func (c *bufConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+
 // SniffCloaked reports whether the first bytes of a connection look like
 // an HTTP request (server side: route cloaked vs plain FSY1).
 func SniffCloaked(br *bufio.Reader) bool {
@@ -59,7 +74,7 @@ func ServeHTTP(conn net.Conn, br *bufio.Reader, path string) net.Conn {
 		req.Header.Get("Connection") != "Upgrade" ||
 		req.Header.Get("Sec-WebSocket-Version") != "13" ||
 		req.URL.Path != path {
-		writeDecoy(conn, req)
+		writeDecoy(conn, req, path)
 		_ = conn.Close()
 		return nil
 	}
@@ -80,11 +95,13 @@ func ServeHTTP(conn net.Conn, br *bufio.Reader, path string) net.Conn {
 	return &wsConn{Conn: conn, rbuf: br, server: true}
 }
 
-func writeDecoy(conn net.Conn, req *http.Request) {
+func writeDecoy(conn net.Conn, req *http.Request, cloakPath string) {
 	body := decoyPage
 	status := "200 OK"
-	if req.URL.Path == "/cdn/data" && req.Method == http.MethodGet {
-		// plausible: the "asset" path exists but requires the upgrade
+	if req.URL.Path == cloakPath && req.Method == http.MethodGet {
+		// plausible: the "asset" path exists but requires the upgrade —
+		// track the CONFIGURED path so probing different paths sees
+		// behavior consistent with the real one
 		status = "404 Not Found"
 		body = "not found\n"
 	}
@@ -233,12 +250,23 @@ func (c *wsConn) Read(p []byte) (int, error) {
 		if err != nil {
 			return 0, err
 		}
+		fin := b0&0x80 != 0
 		opcode := b0 & 0x0F
 		b1, err := c.rbuf.ReadByte()
 		if err != nil {
 			return 0, err
 		}
 		masked := b1&0x80 != 0
+		// RFC 6455: client→server frames MUST be masked. botjim's own
+		// writer never fragments (always FIN|binary), so a data frame that
+		// is unmasked (on the server side) or a continuation/un-FIN frame
+		// is not a real peer — reject rather than mis-parse.
+		if c.server && !masked && opcode < 0x8 {
+			return 0, fmt.Errorf("cloak: unmasked client frame")
+		}
+		if opcode == 0x0 || (!fin && opcode < 0x8) {
+			return 0, fmt.Errorf("cloak: unexpected fragmented frame")
+		}
 		plen := int64(b1 & 0x7F)
 		switch plen {
 		case 126:
@@ -254,7 +282,10 @@ func (c *wsConn) Read(p []byte) (int, error) {
 			}
 			plen = int64(binary.BigEndian.Uint64(ext[:]))
 		}
-		if plen > 17<<20 {
+		if plen < 0 || plen > 17<<20 {
+			// a 127-length frame with the top bit set decodes to a
+			// negative int64; without this guard make([]byte, plen) panics
+			// and one packet crashes the process pre-auth
 			return 0, fmt.Errorf("cloak: implausible frame %d", plen)
 		}
 		var mask [4]byte

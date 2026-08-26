@@ -266,11 +266,13 @@ func (c *recordConn) Read(p []byte) (int, error) {
 	if ctr == 0 || ctr <= c.recvCtr {
 		return 0, errors.New("relay record: replay or reorder")
 	}
-	c.recvCtr = ctr
 	plain, err := aead.Open(nil, nonce, sealed, hdr[:])
 	if err != nil {
 		return 0, errors.New("relay record: authentication failed")
 	}
+	// only an authenticated record advances the window: a forged counter
+	// must not desynchronize the legitimate stream
+	c.recvCtr = ctr
 	n := copy(p, plain)
 	if n < len(plain) {
 		c.rbuf = append(c.rbuf[:0], plain[n:]...)

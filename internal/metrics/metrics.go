@@ -4,10 +4,10 @@
 package metrics
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -48,11 +48,11 @@ func Serve(done <-chan struct{}, addr string, srv *session.Server, started time.
 		_ = ln.Close()
 	}()
 	srvHTTP := &http.Server{Handler: mux}
-	if err := srvHTTP.Serve(ln); err != nil && err.Error() != "http: Server closed" {
-		_ = os.Stdout.Sync()
+	err = srvHTTP.Serve(ln)
+	if err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
-	return nil
+	return nil // listener closed on shutdown
 }
 
 func writeMetric(sb *strings.Builder, name, typ, help string, v int64) {

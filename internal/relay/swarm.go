@@ -28,6 +28,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ziozzang/botjim/internal/chunking"
 )
 
 // DefaultSwarmPort is the tracker's default port.
@@ -73,15 +75,38 @@ func (t *Tracker) Announce(roomID, addr, have string, seed bool) []Peer {
 	room, ok := t.rooms[roomID]
 	if !ok {
 		if len(t.rooms) >= 4096 {
-			return nil // tracker full
+			// sweep dead rooms before refusing: without this, abandoned
+			// rooms accumulate until the tracker is full forever
+			now := time.Now()
+			for id, rm := range t.rooms {
+				alive := false
+				for _, p := range rm {
+					if now.Sub(p.Seen) <= peerTTL {
+						alive = true
+						break
+					}
+				}
+				if !alive {
+					delete(t.rooms, id)
+				}
+			}
+		}
+		if len(t.rooms) >= 4096 {
+			return nil // tracker genuinely full
 		}
 		room = map[string]*Peer{}
 		t.rooms[roomID] = room
 	}
-	// expire stale peers
+	// expire stale peers. Seeds get a longer leash (their announce loop
+	// refreshes every 15s), but a crashed seed must not be handed to
+	// every future joiner forever.
 	now := time.Now()
 	for a, p := range room {
-		if now.Sub(p.Seen) > peerTTL && !p.IsSeed {
+		ttl := peerTTL
+		if p.IsSeed {
+			ttl = 5 * peerTTL
+		}
+		if now.Sub(p.Seen) > ttl {
 			delete(room, a)
 		}
 	}
@@ -144,9 +169,21 @@ func (tp *TrackerProtocol) handle(conn net.Conn) {
 		return
 	}
 	roomID, addr, haveHex, seedStr := f[2], f[3], f[4], f[6]
-	if len(roomID) != 64 || !isHex(roomID) || len(haveHex) > 8192 {
+	if len(roomID) != 64 || !isHex(roomID) || len(haveHex) > 8192 || len(addr) > 256 {
 		fmt.Fprintf(conn, "ERR args\n")
 		return
+	}
+	host, port, aerr := net.SplitHostPort(addr)
+	if aerr != nil {
+		fmt.Fprintf(conn, "ERR addr\n")
+		return
+	}
+	// wildcard/unspecified announce address: substitute the source IP the
+	// tracker actually sees — "[::]:port" is undialable for everyone
+	if ip := net.ParseIP(host); host == "" || (ip != nil && ip.IsUnspecified()) {
+		if rh, _, rerr := net.SplitHostPort(conn.RemoteAddr().String()); rerr == nil {
+			addr = net.JoinHostPort(rh, port)
+		}
 	}
 	seed := seedStr == "1"
 	peers := tp.T.Announce(roomID, addr, haveHex, seed)
@@ -253,7 +290,11 @@ func (m *SwarmManifest) specFromEmbedded() *SwarmSpec {
 	}
 	spec := &SwarmSpec{Version: m.Version, Name: m.Artifact}
 	for _, fe := range m.FileEntries {
-		spec.Files = append(spec.Files, SwarmFile{Path: fe.Path, Size: fe.Size, Mode: fe.Mode, SHA: fe.SHA})
+		// Chunks must survive the round-trip: SpecHash covers the chunk
+		// catalog, so dropping it made every v2 descriptor fail the
+		// hash check below ("descriptor carries no files") — and would
+		// have disabled per-chunk verification even if it hadn't
+		spec.Files = append(spec.Files, SwarmFile{Path: fe.Path, Size: fe.Size, Mode: fe.Mode, SHA: fe.SHA, Chunks: fe.Chunks})
 	}
 	if spec.SpecHash() != m.ManifestSHA {
 		return nil // descriptor and entries disagree: refuse
@@ -263,6 +304,29 @@ func (m *SwarmManifest) specFromEmbedded() *SwarmSpec {
 
 // catalogHex encodes a have-bitmap as hex for announce lines.
 func catalogHex(bitmap []byte) string { return hex.EncodeToString(bitmap) }
+
+func chunkGridFor(size int64) chunking.Grid {
+	return chunking.Grid{Size: size, ChunkSize: chunking.ChunkSizeFor(size)}
+}
+
+// SeedCatalog builds the seed's have-catalog: a full (all-ones) per-file
+// bitmap sized to each file's real chunk count, '/'-joined — the same
+// shape a joiner's catalog() produces, so rarest-first ordering counts
+// the seed for every file (a flat "ffff" collapsed to one field and hid
+// the seed for all files past the first).
+func SeedCatalog(spec *SwarmSpec) string {
+	parts := make([]string, 0, len(spec.Files))
+	for _, f := range spec.Files {
+		grid := chunkGridFor(f.Size)
+		n := grid.Count()
+		bm := make([]byte, (n+7)/8)
+		for i := int64(0); i < n; i++ {
+			bm[i/8] |= 1 << (uint(i) % 8)
+		}
+		parts = append(parts, catalogHex(bm))
+	}
+	return strings.Join(parts, "/")
+}
 
 // catalogDecode parses one back.
 func catalogDecode(s string) ([]byte, error) {

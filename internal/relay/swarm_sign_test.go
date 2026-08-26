@@ -49,3 +49,30 @@ func TestSignVerify(t *testing.T) {
 		t.Fatalf("unsigned spec without pin rejected: %v", err)
 	}
 }
+
+// TestVerifyShortPubKeyNoPanic: attacker-chosen short pubkey/sig values
+// must error cleanly, never slice-panic.
+func TestVerifyShortPubKeyNoPanic(t *testing.T) {
+	// both halves present but malformed → rejected outright
+	bad := SwarmManifest{PubKey: "ab", Sig: "cd"}
+	if err := bad.Verify(""); err == nil {
+		t.Fatal("malformed keypair accepted")
+	}
+	// a signature without a public key (or vice versa) is meaningless →
+	// treated as unsigned (accepted without a pin, rejected with one)
+	for i, orphan := range []SwarmManifest{{Sig: "ff"}, {PubKey: "00112233"}} {
+		if err := orphan.Verify(""); err != nil {
+			t.Fatalf("case %d: partial signature treated as signed: %v", i, err)
+		}
+		if err := orphan.Verify("aa"); err == nil {
+			t.Fatalf("case %d: partial signature accepted with a pinned key", i)
+		}
+	}
+	m := &SwarmManifest{PubKey: "ab", Sig: "cd"}
+	if err := m.Verify("ab"); err == nil {
+		t.Fatal("short key accepted when pinned")
+	}
+	// different-key error path with short keys must not panic either
+	m2 := &SwarmManifest{PubKey: "abcd", Sig: "0011"}
+	_ = m2.Verify("zzzz")
+}

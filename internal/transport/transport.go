@@ -88,6 +88,9 @@ type SecOpts struct {
 var (
 	CloakSniff func(br *bufio.Reader) bool
 	CloakServe func(conn net.Conn, br *bufio.Reader, path string) net.Conn
+	// CloakPlain rewraps a sniffed-but-not-HTTP connection so buffered
+	// bytes are not lost (nil → use the raw conn).
+	CloakPlain func(conn net.Conn, br *bufio.Reader) net.Conn
 )
 
 // CloakDialer is installed by the cloak package (transport stays

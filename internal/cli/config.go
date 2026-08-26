@@ -47,6 +47,11 @@ type MeshConfig struct {
 	Key     string `json:"key"`              // pinned ed25519 public key (hex)
 	Version int64  `json:"version"`          // last applied envelope version
 	Origin  string `json:"origin,omitempty"` // which node produced it
+	// Managed lists the endpoint names owned by the mesh (set by the last
+	// applied envelope). A name previously managed that is absent from the
+	// next envelope is deleted — this is how endpoint removal propagates;
+	// purely node-local endpoints never enter this list and survive.
+	Managed []string `json:"managed,omitempty"`
 }
 
 // Endpoint is one named remote.
@@ -202,22 +207,25 @@ func applyConfigFromDefaults(f *flags, parsedArgs []string) {
 
 // cmdConfig implements `botjim config show|path`.
 func cmdConfig(args []string) int {
-	if len(args) == 0 {
+	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
 		fmt.Fprint(os.Stderr, `usage:
   botjim config path           print the config file location
   botjim config show           print the loaded config (JSON)
   botjim config publish        sign the endpoints as a mesh envelope
 `)
+		if len(args) >= 1 {
+			return 0
+		}
 		return 3
 	}
 	switch args[0] {
 	case "path":
-		fmt.Println(ConfigPath())
+		fmt.Println(configPathEnv()) // honors $BOTJIM_CONFIG like every lookup
 		return 0
 	case "publish":
 		return cmdConfigPublish(args[1:])
 	case "show":
-		cfg, err := LoadConfig(ConfigPath())
+		cfg, err := LoadConfig(configPathEnv())
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			return 1

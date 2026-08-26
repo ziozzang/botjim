@@ -56,7 +56,9 @@ const (
 	FeatDevices  = 1 << 5
 	FeatUname    = 1 << 6
 	FeatBrowser  = 1 << 7
-	FeatAll      = FeatZstd | FeatLz4 | FeatXattr | FeatHardlink | FeatSparse | FeatDevices | FeatUname | FeatBrowser
+	FeatClaimAck = 1 << 8 // sender reports verified delta claims (MsgClaimResult)
+	FeatChunkSum = 1 << 9 // per-chunk crc32c trailer on data frames
+	FeatAll      = FeatZstd | FeatLz4 | FeatXattr | FeatHardlink | FeatSparse | FeatDevices | FeatUname | FeatBrowser | FeatClaimAck | FeatChunkSum
 )
 
 // Handshake is 36 bytes on the wire:
@@ -167,6 +169,7 @@ const (
 	MsgDone          uint8 = 0x34
 	MsgCommit        uint8 = 0x35 // sender→receiver: untrusted claim fully verified
 	MsgChunkRequest  uint8 = 0x36 // receiver→source: request-driven chunk fetch
+	MsgClaimResult   uint8 = 0x37 // sender→receiver: which delta claims verified
 )
 
 // CtrlFrameFlags — control payload compression.

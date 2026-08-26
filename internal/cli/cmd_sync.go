@@ -18,8 +18,11 @@ import (
 // The engine (delta, resume, verification, --delete semantics) is the
 // plain send/pull path; sync adds policy lookup and reporting.
 func cmdSync(args []string) int {
-	if len(args) < 1 {
+	if len(args) < 1 || args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
 		syncUsage()
+		if len(args) >= 1 {
+			return 0
+		}
 		return 3
 	}
 	switch args[0] {
@@ -67,7 +70,12 @@ func syncPush(args []string) int {
 	fs.BoolVar(&watch, "watch", false, "keep running: re-push whenever the source settles after changes\n(each re-push is a delta, so it is cheap)")
 	fs.IntVar(&quietMs, "debounce-ms", 500, "watch: quiet period before a re-push fires")
 	fs.IntVar(&sweepSec, "sweep-sec", 30, "watch: periodic full check for missed events")
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		if parseHelp(err) {
+			return 0
+		}
+		return 3 // a typo'd flag must never fall through to a mirror run
+	}
 	if fs.NArg() < 1 {
 		fmt.Fprintln(os.Stderr, "error: sync push needs an endpoint NAME")
 		return 3
@@ -90,8 +98,14 @@ func syncPush(args []string) int {
 		// mirror semantics: delete dest entries missing from the source
 		f.deleteDst = true
 	}
-	// mirror the *contents* of dir, so chdir there and send "." —
-	// otherwise the last path component would land as a subdirectory
+	// mirror the *contents* of dir: chdir there and send "." so the
+	// mirror lands at the jail root. Resolve the absolute path FIRST —
+	// after the chdir a relative --dir would point at dir/dir.
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: bad --dir %s: %v\n", dir, err)
+		return 3
+	}
 	if err := os.Chdir(dir); err != nil {
 		fmt.Fprintf(os.Stderr, "error: cannot enter %s: %v\n", dir, err)
 		return 2
@@ -99,12 +113,9 @@ func syncPush(args []string) int {
 	if !watch {
 		return runClient(context.Background(), f.withRoot(dir))
 	}
-	// watch mode: stay in the original cwd only for the watcher's paths —
-	// we already chdir'd, and each push re-enters the same dir
-	abs, _ := filepath.Abs(dir)
-	if abs == "" {
-		abs = dir
-	}
+	// watch mode: each re-push runs under the watch ctx so one Ctrl-C
+	// cancels an in-flight push too (double-interrupt still hard-exits)
+	ctx := signalContext()
 	fmt.Fprintf(os.Stderr, "watching %s → %s (debounce %dms)\n", abs, ep.Addr, quietMs)
 	push := func() error {
 		f2 := syncFlags(ep)
@@ -112,13 +123,12 @@ func syncPush(args []string) int {
 		f2.exclude = f.exclude
 		f2.deleteDst = f.deleteDst
 		f2.quiet = true
-		code := runClient(context.Background(), f2.withRoot(dir))
-		if code != 0 {
+		code := runClient(ctx, f2.withRoot(dir))
+		if code != 0 && ctx.Err() == nil {
 			return fmt.Errorf("push exited %d", code)
 		}
 		return nil
 	}
-	ctx := signalContext()
 	if err := watchLoop(ctx, abs, time.Duration(quietMs)*time.Millisecond, time.Duration(sweepSec)*time.Second, push); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 2
@@ -131,7 +141,12 @@ func syncPull(args []string) int {
 	fs := newFlagSet("sync pull", "botjim sync pull [--dest DIR] NAME",
 		"One-shot mirror: pull the endpoint NAME's root into DIR.\nApplies the target's include/exclude/delete/dest policy.")
 	fs.StringVar(&dest, "dest", "", "receive directory (default: the target's autosync dest)")
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		if parseHelp(err) {
+			return 0
+		}
+		return 3
+	}
 	if fs.NArg() < 1 {
 		fmt.Fprintln(os.Stderr, "error: sync pull needs an endpoint NAME")
 		return 3

@@ -12,10 +12,12 @@
 package audit
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 )
@@ -43,16 +45,39 @@ type Journal struct {
 // Open appends to path (created when missing), resuming the chain from
 // the last intact entry found there.
 func Open(path string) (*Journal, error) {
-	// resume: read the tail entry for seq + head
-	entries, err := ReadAll(path)
+	// resume: read the tail entry for seq + head, and repair a torn
+	// tail — a crash mid-Append leaves a partial line that would
+	// otherwise swallow every future entry (O_APPEND writes onto it and
+	// ReadAll stops there forever while Append keeps succeeding)
+	entries, validLen, torn, err := readAllValid(path)
+	if err != nil {
+		return nil, err
+	}
 	j := &Journal{}
-	if err == nil && len(entries) > 0 {
+	if len(entries) > 0 {
 		last := entries[len(entries)-1]
 		j.seq = last.Seq
 		j.head = last.Hash
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o640)
 	if err != nil {
+		return nil, err
+	}
+	if fi, err := f.Stat(); err == nil && fi.Size() > int64(validLen) {
+		if !torn {
+			// complete-but-unparseable lines mid-file are tampering or
+			// corruption, never a torn tail: truncating would DESTROY the
+			// evidence the journal exists to keep. Fail closed instead.
+			f.Close()
+			return nil, fmt.Errorf("audit: %s has unreadable entries after byte %d (not a torn tail) — inspect with 'botjim audit verify' before appending", path, validLen)
+		}
+		if err := f.Truncate(int64(validLen)); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("audit: torn tail repair: %w", err)
+		}
+	}
+	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+		f.Close()
 		return nil, err
 	}
 	j.path = f
@@ -104,25 +129,46 @@ func hashEntry(e *Entry) string {
 // ReadAll streams the journal. It returns entries and stops at the first
 // unreadable line (a torn tail from a crash is not an error).
 func ReadAll(path string) ([]Entry, error) {
+	entries, _, _, err := readAllValid(path)
+	return entries, err
+}
+
+// readAllValid parses the intact prefix of the journal and reports how
+// many bytes it spans. torn means everything past the prefix is a single
+// trailing partial line with no newline — the signature of a crash during
+// Append, safe to truncate before the next append (otherwise that append
+// lands on the partial line and becomes invisible forever). Unparseable
+// bytes followed by more lines are corruption/tampering, NOT torn.
+func readAllValid(path string) ([]Entry, int, bool, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, 0, false, nil
 		}
-		return nil, err
+		return nil, 0, false, err
 	}
 	var out []Entry
-	for _, line := range splitLines(b) {
-		if len(line) == 0 {
-			continue
+	valid := 0
+	for len(b) > 0 {
+		idx := bytes.IndexByte(b, '\n')
+		if idx < 0 {
+			// trailing partial line (no newline): torn tail
+			return out, valid, true, nil
 		}
-		var e Entry
-		if err := json.Unmarshal(line, &e); err != nil {
-			break // torn tail
+		line := b[:idx]
+		if len(line) > 0 {
+			var e Entry
+			if err := json.Unmarshal(line, &e); err != nil {
+				// a complete newline-terminated line that does not parse:
+				// the intact prefix ends here, and the rest is evidence
+				return out, valid, false, nil
+			}
+			out = append(out, e)
 		}
-		out = append(out, e)
+		valid += idx + 1
+		b = b[idx+1:]
 	}
-	return out, nil
+	return out, valid, false, nil
 }
 
 // Verify walks the chain and returns the number of intact entries plus
@@ -143,19 +189,4 @@ func Verify(path string) (intact int, breakAt string, err error) {
 		prev = e.Hash
 	}
 	return len(entries), "", nil
-}
-
-func splitLines(b []byte) [][]byte {
-	var out [][]byte
-	start := 0
-	for i := 0; i < len(b); i++ {
-		if b[i] == '\n' {
-			out = append(out, b[start:i])
-			start = i + 1
-		}
-	}
-	if start < len(b) {
-		out = append(out, b[start:])
-	}
-	return out
 }

@@ -12,4 +12,5 @@ func init() {
 	transport.CloakDialer = cloak.Dial
 	transport.CloakSniff = cloak.SniffCloaked
 	transport.CloakServe = cloak.ServeHTTP
+	transport.CloakPlain = cloak.PlainConn
 }

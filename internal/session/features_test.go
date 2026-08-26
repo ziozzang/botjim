@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -235,5 +236,189 @@ func TestDryRun(t *testing.T) {
 	// nothing re-transferred
 	if res.Report.Bytes != 0 {
 		t.Fatalf("dry-run moved %d bytes", res.Report.Bytes)
+	}
+}
+
+// TestDeltaZeroChunk: a chunk that becomes all-zero in the new version
+// must be physically zeroed at the destination — the fresh-part hole
+// optimization must not leave the old bytes behind (regression).
+func TestDeltaZeroChunk(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+	body := make([]byte, 12<<20)
+	for i := range body {
+		body[i] = byte(i%250) + 1 // no zero bytes
+	}
+	if err := os.WriteFile(filepath.Join(src, "data.bin"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	addr, _, stop := startTestServer(t, dst, true, true)
+	res := RunTransfer(context.Background(), ClientConfig{
+		Addr: addr, Direction: protocol.DirPush, Paths: []string{filepath.Join(src, "data.bin")},
+		Parallel: 2, Preserve: protocol.PreserveSparse,
+	})
+	if res.Err != nil {
+		t.Fatal(res.Err)
+	}
+	stop()
+
+	// zero out chunk 1 (4-8 MiB)
+	body2 := append([]byte(nil), body...)
+	for i := 4 << 20; i < 8<<20; i++ {
+		body2[i] = 0
+	}
+	if err := os.WriteFile(filepath.Join(src, "data.bin"), body2, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	os.Chtimes(filepath.Join(src, "data.bin"), time.Now(), time.Now().Add(time.Second))
+
+	addr2, _, stop2 := startTestServer(t, dst, true, true)
+	defer stop2()
+	res = RunTransfer(context.Background(), ClientConfig{
+		Addr: addr2, Direction: protocol.DirPush, Paths: []string{filepath.Join(src, "data.bin")},
+		Parallel: 2, Preserve: protocol.PreserveSparse,
+	})
+	if res.Err != nil {
+		t.Fatal(res.Err)
+	}
+	got, err := os.ReadFile(filepath.Join(dst, "data.bin"))
+	if err != nil || !bytes.Equal(got, body2) {
+		t.Fatal("zeroed chunk kept the old bytes (delta zero-write regression)")
+	}
+}
+
+// TestRebuildClaimsUntrusted: a leftover part WITHOUT its sidecar whose
+// content does not match the source must not be silently adopted — the
+// rebuilt claim goes out with hashes and the sender resends mismatches
+// (regression: stale parts used to be trusted verbatim).
+func TestRebuildClaimsUntrusted(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+	body := make([]byte, 12<<20)
+	for i := range body {
+		body[i] = byte((i * 7) % 249)
+	}
+	if err := os.WriteFile(filepath.Join(src, "data.bin"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// craft a stale, sidecar-less part at the destination (an interrupted
+	// older session whose source has since changed)
+	stale := make([]byte, 12<<20)
+	for i := range stale {
+		stale[i] = byte(i % 199)
+	}
+	if err := os.WriteFile(filepath.Join(dst, "data.bin.fs-part-deadbeef00000000"), stale, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	addr, _, stop := startTestServer(t, dst, true, true)
+	defer stop()
+	res := RunTransfer(context.Background(), ClientConfig{
+		Addr: addr, Direction: protocol.DirPush, Paths: []string{filepath.Join(src, "data.bin")},
+		Parallel: 2,
+	})
+	if res.Err != nil {
+		t.Fatal(res.Err)
+	}
+	got, err := os.ReadFile(filepath.Join(dst, "data.bin"))
+	if err != nil || !bytes.Equal(got, body) {
+		t.Fatal("stale sidecar-less part was adopted without verification")
+	}
+}
+
+// TestDeltaPreservesSidecarSibling: a delta-adopted file must not clobber
+// a legitimate sibling named <final>.json (the adopted sidecar used to
+// land there and then get deleted — silent data loss).
+func TestDeltaPreservesSidecarSibling(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+	body := make([]byte, 12<<20)
+	for i := range body {
+		body[i] = byte(i % 253)
+	}
+	os.WriteFile(filepath.Join(src, "data.bin"), body, 0o644)
+
+	addr, _, stop := startTestServer(t, dst, true, true)
+	if r := RunTransfer(context.Background(), ClientConfig{
+		Addr: addr, Direction: protocol.DirPush, Paths: []string{filepath.Join(src, "data.bin")}, Parallel: 2,
+	}); r.Err != nil {
+		t.Fatal(r.Err)
+	}
+	stop()
+	// an innocent bystander in the dest whose name collides with the
+	// adopted sidecar's degraded path (<final>.json)
+	if err := os.WriteFile(filepath.Join(dst, "data.bin.json"), []byte("precious sibling"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 1<<20; i++ {
+		body[i] ^= 0xAA
+	}
+	os.WriteFile(filepath.Join(src, "data.bin"), body, 0o644)
+	os.Chtimes(filepath.Join(src, "data.bin"), time.Now(), time.Now().Add(time.Second))
+
+	addr2, _, stop2 := startTestServer(t, dst, true, true)
+	defer stop2()
+	res := RunTransfer(context.Background(), ClientConfig{
+		Addr: addr2, Direction: protocol.DirPush, Paths: []string{filepath.Join(src, "data.bin")}, Parallel: 2,
+	})
+	if res.Err != nil {
+		t.Fatal(res.Err)
+	}
+	sib, err := os.ReadFile(filepath.Join(dst, "data.bin.json"))
+	if err != nil || string(sib) != "precious sibling" {
+		t.Fatalf("sidecar sibling clobbered: %q %v", sib, err)
+	}
+	got, _ := os.ReadFile(filepath.Join(dst, "data.bin"))
+	if !bytes.Equal(got, body) {
+		t.Fatal("delta content wrong")
+	}
+}
+
+// TestDeltaReadOnlyDestNoStall: a read-only destination file must fall
+// through to a fresh part, not stall the whole transfer for 120s.
+func TestDeltaReadOnlyDestNoStall(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+	body := make([]byte, 8<<20)
+	for i := range body {
+		body[i] = byte(i % 247)
+	}
+	os.WriteFile(filepath.Join(src, "data.bin"), body, 0o644)
+	addr, _, stop := startTestServer(t, dst, true, true)
+	if r := RunTransfer(context.Background(), ClientConfig{
+		Addr: addr, Direction: protocol.DirPush, Paths: []string{filepath.Join(src, "data.bin")}, Parallel: 2,
+	}); r.Err != nil {
+		t.Fatal(r.Err)
+	}
+	stop()
+	if err := os.Chmod(filepath.Join(dst, "data.bin"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 1<<20; i++ {
+		body[i] ^= 0x5A
+	}
+	os.WriteFile(filepath.Join(src, "data.bin"), body, 0o644)
+	os.Chtimes(filepath.Join(src, "data.bin"), time.Now(), time.Now().Add(time.Second))
+
+	addr2, _, stop2 := startTestServer(t, dst, true, true)
+	defer stop2()
+	done := make(chan ClientResult, 1)
+	go func() {
+		done <- RunTransfer(context.Background(), ClientConfig{
+			Addr: addr2, Direction: protocol.DirPush, Paths: []string{filepath.Join(src, "data.bin")}, Parallel: 2,
+		})
+	}()
+	select {
+	case res := <-done:
+		if res.Err != nil {
+			t.Fatal(res.Err)
+		}
+		got, _ := os.ReadFile(filepath.Join(dst, "data.bin"))
+		if !bytes.Equal(got, body) {
+			t.Fatal("read-only delta content wrong")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("transfer stalled on a read-only destination file")
 	}
 }

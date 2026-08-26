@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -65,6 +66,7 @@ type Receiver struct {
 	partDirs   map[string]bool     // directories already scanned
 	partsByDir map[string][]string // dir → part basenames (session-visible)
 
+	chunkSum bool // peer negotiated FeatChunkSum: every data frame must carry a sum
 }
 
 type rxFile struct {
@@ -81,6 +83,20 @@ type rxFile struct {
 	mu          sync.Mutex // guards sc/dirty/retries
 	retries     map[uint64]int
 	adopted     bool // final adopted as its own part (untrusted until Commit)
+	// adopted-claim resolution: with a FeatClaimAck sender, finalize must
+	// wait for Commit/ClaimResult — the optimistic claims alone say
+	// nothing about which corrections are still in flight
+	awaitClaims    bool
+	claimsResolved bool
+	arrived        map[int64]bool // chunks that came over the wire
+	// mayStale: the part carried bytes before this session (resumed part
+	// or adopted final) — a zero chunk must be written as zeros, not
+	// assumed to be a hole
+	mayStale bool
+	// metaPath overrides where the sidecar is written. Delta adoption has
+	// partPath==abs (no .fs-part- infix), so MetaPathForPart would degrade
+	// to abs+".json" and clobber a legitimate sibling — set this instead.
+	metaPath string
 }
 
 type hardlinkJob struct {
@@ -90,7 +106,7 @@ type hardlinkJob struct {
 
 // NewReceiver builds a receiver core rooted at root (absolute, resolved).
 func NewReceiver(sess *transport.Session, ctrl *protocol.CtrlStream, opts Options, reg *progress.Registry, root string) *Receiver {
-	return &Receiver{
+	r := &Receiver{
 		sess: sess, ctrl: ctrl, opts: opts, reg: reg, root: root, nonce: opts.Nonce,
 		files:      map[uint32]*rxFile{},
 		caseSeen:   map[string]string{},
@@ -102,6 +118,10 @@ func NewReceiver(sess *transport.Session, ctrl *protocol.CtrlStream, opts Option
 		partDirs:   map[string]bool{},
 		partsByDir: map[string][]string{},
 	}
+	if sess != nil && sess.HS != nil {
+		r.chunkSum = sess.HS.FeatureBits&protocol.FeatChunkSum != 0
+	}
+	return r
 }
 
 // discoverPartsOnce finds existing part files for a final path with one
@@ -330,6 +350,12 @@ func (r *Receiver) readCtrl(ctx context.Context, cancel context.CancelFunc) erro
 				return err
 			}
 			r.commitFile(m.FileID)
+		case protocol.MsgClaimResult:
+			m, err := protocol.DecodeClaimResult(payload)
+			if err != nil {
+				return err
+			}
+			r.claimResult(m)
 		case protocol.MsgCancel:
 			r.mu.Lock()
 			r.report.Cancelled = true
@@ -494,8 +520,11 @@ func (r *Receiver) prepareRegular(ctx context.Context, e manifest.Entry) {
 	// delta: a same-size final with a different mtime becomes its own part —
 	// its chunks are re-hashed and only the differing ones arrive in place
 	if fi, err := os.Lstat(abs); err == nil && fi.Mode().IsRegular() && fi.Size() == e.Size && grid.Count() > 0 && r.opts.Resume != 2 {
-		r.adoptFinalAsPart(abs, e, grid)
-		return
+		if r.adoptFinalAsPart(abs, e, grid) {
+			return
+		}
+		// adoption failed (read-only, locked, grew): fall through to a
+		// fresh part rather than stalling the whole transfer on this file
 	}
 
 	// disk-space guard: refuse a file that cannot fit (the transfer's
@@ -568,15 +597,26 @@ func (r *Receiver) prepareRegular(ctx context.Context, e manifest.Entry) {
 	}
 	r.trackPart(abs, filepath.Base(part))
 	f.part = pf
+	f.mayStale = partExisted
 
 	// verify have-bits by re-hashing the part (bitmap is a hint; data rules).
 	// a part without a usable sidecar is fully rehashed to rebuild it — with
 	// one carve-out: zero chunks cannot be trusted there, because an
 	// unwritten hole is indistinguishable from a real zero chunk. They are
 	// re-requested instead (the sender re-sends real holes as zero-flags).
+	rebuilt := partExisted && !scHadSidecar
 	resumed := int64(0)
-	if !sc.FullyWritten && (sc.HaveCount() > 0 || (partExisted && !scHadSidecar)) {
-		resumed = r.rehashPart(f, e, grid, partExisted && !scHadSidecar)
+	if !sc.FullyWritten && (sc.HaveCount() > 0 || rebuilt) {
+		resumed = r.rehashPart(f, e, grid, rebuilt)
+	}
+	if rebuilt && sc.HaveCount() > 0 {
+		// a part without its sidecar was rebuilt from its own bytes: the
+		// claim is self-referential (nothing compared it to the source),
+		// so it is UNTRUSTED — the sender verifies each hash and resends
+		// mismatches, exactly like delta adoption
+		f.adopted = true
+		f.arrived = map[int64]bool{}
+		f.awaitClaims = r.sess.HS.FeatureBits&protocol.FeatClaimAck != 0
 	}
 
 	// register BEFORE the bitmap goes out: the sender may stream chunks the
@@ -585,7 +625,11 @@ func (r *Receiver) prepareRegular(ctx context.Context, e manifest.Entry) {
 	r.mu.Lock()
 	r.files[e.ID] = f
 	r.mu.Unlock()
-	r.sendHave(e.ID, protocol.HavePartial, sc.Bitmap())
+	if f.adopted {
+		r.sendHaveHashes(e.ID, protocol.HavePartial, sc.Bitmap(), claimHashes(sc, grid))
+	} else {
+		r.sendHave(e.ID, protocol.HavePartial, sc.Bitmap())
+	}
 	if resumed > 0 {
 		r.reg.AddSkipped(resumed)
 		r.reg.FileDoneBytes(e.ID, resumed)
@@ -595,7 +639,7 @@ func (r *Receiver) prepareRegular(ctx context.Context, e manifest.Entry) {
 	// fully-resumed or FullyWritten sidecar: straight to finalize (chunks
 	// may already be arriving: take the per-file lock for the check)
 	f.mu.Lock()
-	complete := sc.Complete()
+	complete := sc.Complete() && (!f.awaitClaims || f.claimsResolved)
 	f.mu.Unlock()
 	if complete {
 		r.queueFinalize(e.ID)
@@ -655,32 +699,38 @@ func (r *Receiver) hashInto(fd *os.File, e manifest.Entry, grid chunking.Grid, s
 // transfer's own part: chunks are re-hashed, differing ones arrive in
 // place, and finalize skips the rename (the file is already at home). A
 // crash mid-delta leaves a torn final + sidecar, which resume repairs.
-func (r *Receiver) adoptFinalAsPart(abs string, e manifest.Entry, grid chunking.Grid) {
+func (r *Receiver) adoptFinalAsPart(abs string, e manifest.Entry, grid chunking.Grid) bool {
 	fd, err := os.OpenFile(abs, os.O_RDWR, 0)
 	if err != nil {
-		// read-only or busy: fall through to a fresh part
-		return
+		return false // read-only or busy: caller falls through to a fresh part
+	}
+	// take the same exclusive flock a part gets: writing corrections into
+	// the FINAL file with no lock let two overlapping sessions interleave
+	// different source versions into one file
+	if err := unix.Flock(int(fd.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		_ = fd.Close()
+		return false
+	}
+	// the file may have grown between Lstat and open: trim the tail so the
+	// adopted part matches the manifest size exactly
+	if err := fd.Truncate(e.Size); err != nil {
+		_ = fd.Close()
+		return false
 	}
 	sc := sidecar.New(e, r.nonce)
 	r.hashInto(fd, e, grid, sc)
-	f := &rxFile{entry: e, abs: abs, partPath: abs, part: fd, sc: sc, retries: map[uint64]int{}}
+	f := &rxFile{entry: e, abs: abs, partPath: abs, part: fd, sc: sc, retries: map[uint64]int{}, adopted: true, arrived: map[int64]bool{}, mayStale: true, metaPath: sidecar.MetaPath(abs, r.nonce)}
+	// a FeatClaimAck sender answers claims with Commit or ClaimResult;
+	// until then the optimistic claims below must not trigger finalize —
+	// the first arriving correction would finalize while later ones are
+	// still in flight, leaving stale chunks in the final file
+	f.awaitClaims = sc.HaveCount() > 0 && r.sess.HS.FeatureBits&protocol.FeatClaimAck != 0
+	// the claim is untrusted (the source changed since this file was
+	// written): attach the hashes so the sender verifies before skipping
+	hashes := claimHashes(sc, grid)
 	r.mu.Lock()
 	r.files[e.ID] = f
 	r.mu.Unlock()
-
-	// the claim is untrusted (the source changed since this file was
-	// written): attach the hashes so the sender verifies before skipping
-	var hashes [][32]byte
-	for i := int64(0); i < grid.Count(); i++ {
-		if sc.Have(i) {
-			hexs := sc.Hashes[i]
-			if raw, ok := unhex32(hexs); ok {
-				hashes = append(hashes, raw)
-			} else {
-				hashes = append(hashes, chunking.ZeroHash)
-			}
-		}
-	}
 	r.sendHaveHashes(e.ID, protocol.HavePartial, sc.Bitmap(), hashes)
 
 	if resumed := sc.HaveCount() * grid.ChunkSize; resumed > 0 {
@@ -688,9 +738,25 @@ func (r *Receiver) adoptFinalAsPart(abs string, e manifest.Entry, grid chunking.
 	}
 	r.reg.FileStateUpdate(e.ID, "active", "")
 	// deliberately NOT finalizing on sc.Complete(): the claim is untrusted,
-	// so completion means either chunks arrive (maybeComplete fires) or the
-	// sender sends Commit (fully verified)
-	f.adopted = true
+	// so completion means the sender's Commit/ClaimResult verdict plus
+	// every still-in-flight correction arriving
+	return true
+}
+
+// claimHashes returns one SHA-256 per claimed chunk, in bitmap order —
+// the untrusted-claim attachment the sender verifies before skipping.
+func claimHashes(sc *sidecar.Sidecar, grid chunking.Grid) [][32]byte {
+	var hashes [][32]byte
+	for i := int64(0); i < grid.Count(); i++ {
+		if sc.Have(i) {
+			if raw, ok := unhex32(sc.Hashes[i]); ok {
+				hashes = append(hashes, raw)
+			} else {
+				hashes = append(hashes, chunking.ZeroHash)
+			}
+		}
+	}
+	return hashes
 }
 
 func unhex32(s string) ([32]byte, bool) {
@@ -887,8 +953,9 @@ func (r *Receiver) handleStream(ctx context.Context, conn net.Conn) {
 func (r *Receiver) absorbChunk(codec compress.Codec, hdr protocol.ChunkHeader, payload []byte, dbufp *[]byte) error {
 	r.mu.Lock()
 	f := r.files[hdr.FileID]
+	stale := f == nil || f.errored || f.resolved
 	r.mu.Unlock()
-	if f == nil || f.errored || f.resolved {
+	if stale {
 		return nil // stale chunk after resolution: drop quietly
 	}
 	grid := f.entry.Grid()
@@ -898,13 +965,55 @@ func (r *Receiver) absorbChunk(codec compress.Codec, hdr protocol.ChunkHeader, p
 	idx := int64(hdr.ChunkIdx)
 	expected := grid.Len(idx)
 
+	// negotiated frame checksum: verify before touching anything — this is
+	// the only integrity check raw (incompressible) chunks get on the wire
+	if r.chunkSum && hdr.Flags&protocol.ChunkFlagSum == 0 {
+		return fmt.Errorf("chunk %d: missing checksum (FeatChunkSum negotiated)", idx)
+	}
+	if hdr.Flags&protocol.ChunkFlagSum != 0 {
+		if len(payload) < 4 {
+			return fmt.Errorf("chunk %d: truncated checksum frame", idx)
+		}
+		body := payload[:len(payload)-4]
+		want := binary.LittleEndian.Uint32(payload[len(payload)-4:])
+		if protocol.ChunkSum(hdr, body) != want {
+			return fmt.Errorf("chunk %d: frame checksum mismatch (wire corruption)", idx)
+		}
+		payload = body
+	}
+
+	// snapshot the part fd under f.mu: the finalizer nils it (then closes)
+	// once the file completes, and a duplicate chunk racing that window
+	// must never write into a part being renamed into place
+	f.mu.Lock()
+	part := f.part
+	// adopted files claim chunks optimistically and the sender re-sends
+	// the corrections — those must overwrite; everywhere else an already-
+	// verified chunk arriving again is a duplicate to drop
+	dup := f.sc.Have(idx) && !f.adopted
+	f.mu.Unlock()
+	if part == nil || dup {
+		return nil // finalizing (or already have): drop quietly
+	}
+
 	if hdr.Flags&protocol.ChunkFlagZero != 0 {
 		if expected == 0 {
 			return nil
 		}
+		if f.mayStale {
+			// the part held bytes before this session: a zero chunk must
+			// be written as zeros — skipping the write (the fresh-part
+			// hole optimization) would leave the old bytes in the final
+			if err := writeZeros(part, grid.Offset(idx), expected); err != nil {
+				return fmt.Errorf("chunk %d zero write: %w", idx, err)
+			}
+		}
 		f.mu.Lock()
 		f.sc.SetHave(idx, chunking.ZeroHash, true)
 		f.dirty = true
+		if f.arrived != nil {
+			f.arrived[idx] = true
+		}
 		f.mu.Unlock()
 		r.reg.AddSent(expected)
 		r.reg.FileDoneBytes(hdr.FileID, expected)
@@ -929,13 +1038,16 @@ func (r *Receiver) absorbChunk(codec compress.Codec, hdr protocol.ChunkHeader, p
 			return fmt.Errorf("chunk %d: %d bytes, expected %d", idx, len(data), expected)
 		}
 	}
-	if _, err := f.part.WriteAt(data, grid.Offset(idx)); err != nil {
+	if _, err := part.WriteAt(data, grid.Offset(idx)); err != nil {
 		return fmt.Errorf("chunk %d write: %w", idx, err)
 	}
 	h := chunking.ChunkSHA(f.entry.RelPath, idx, data)
 	f.mu.Lock()
 	f.sc.SetHave(idx, h, false)
 	f.dirty = true
+	if f.arrived != nil {
+		f.arrived[idx] = true
+	}
 	f.mu.Unlock()
 	r.reg.AddSent(expected)
 	r.reg.FileDoneBytes(hdr.FileID, expected)
@@ -946,7 +1058,7 @@ func (r *Receiver) absorbChunk(codec compress.Codec, hdr protocol.ChunkHeader, p
 // maybeComplete queues finalize when the last missing chunk lands.
 func (r *Receiver) maybeComplete(f *rxFile, id uint32) {
 	f.mu.Lock()
-	complete := f.sc.Complete()
+	complete := f.sc.Complete() && (!f.awaitClaims || f.claimsResolved)
 	queued := f.finalQueued
 	if complete && !queued {
 		f.finalQueued = true
@@ -961,7 +1073,14 @@ func (r *Receiver) queueFinalize(id uint32) {
 	select {
 	case r.finalizeCh <- id:
 	default:
-		go func() { r.finalizeCh <- id }()
+		// channel full: hand off without leaking a goroutine forever if
+		// the finalizer has already retired (drainFinalize covers the tail)
+		go func() {
+			select {
+			case r.finalizeCh <- id:
+			case <-r.ctrlDone:
+			}
+		}()
 	}
 }
 
@@ -984,8 +1103,9 @@ func (r *Receiver) runFinalizer(ctx context.Context) error {
 func (r *Receiver) finalize(id uint32) {
 	r.mu.Lock()
 	f := r.files[id]
+	done := f == nil || f.resolved || f.errored
 	r.mu.Unlock()
-	if f == nil || f.resolved || f.errored {
+	if done {
 		return
 	}
 	e := f.entry
@@ -1015,7 +1135,7 @@ func (r *Receiver) finalize(id uint32) {
 	// and drop the sidecar and any stale siblings
 	f.mu.Lock()
 	f.sc.FullyWritten = true
-	serr := f.sc.SaveAtomic(f.partPath)
+	serr := r.saveSidecar(f)
 	f.mu.Unlock()
 	if serr != nil {
 		r.failFile(f, CodeIO, "sidecar: "+serr.Error())
@@ -1027,7 +1147,11 @@ func (r *Receiver) finalize(id uint32) {
 			return
 		}
 	}
-	_ = os.Remove(sidecar.MetaPathForPart(f.partPath))
+	if f.metaPath != "" {
+		_ = os.Remove(f.metaPath)
+	} else {
+		_ = os.Remove(sidecar.MetaPathForPart(f.partPath))
+	}
 	r.forgetParts(f.abs, filepath.Base(f.partPath))
 	_, _, stale := r.discoverPartsOnce(f.abs)
 	for _, s := range stale {
@@ -1144,6 +1268,7 @@ func (r *Receiver) maybePostPass(final bool) {
 	r.postRan = true
 	jobs := append([]hardlinkJob(nil), r.hardlinks...)
 	dirs := append([]manifest.Entry(nil), r.dirs...)
+	manifestDone, aborted := r.manifestDone, r.aborted
 	type doneFile struct {
 		id  uint32
 		abs string
@@ -1191,7 +1316,7 @@ func (r *Receiver) maybePostPass(final bool) {
 
 	// mirror: delete jail entries the manifest does not carry (only after
 	// a clean manifest end; never on a cancelled/postless unwind)
-	if r.opts.Preserve&protocol.PreserveDelete != 0 && r.manifestDone && !r.aborted {
+	if r.opts.Preserve&protocol.PreserveDelete != 0 && manifestDone && !aborted {
 		r.deleteExtraLocked()
 	}
 	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i].RelPath) > len(dirs[j].RelPath) })
@@ -1279,10 +1404,12 @@ func (r *Receiver) failFile(f *rxFile, code uint16, msg string) {
 	r.report.Errors = append(r.report.Errors, FileError{Path: f.entry.RelPath, Code: code, Msg: msg})
 	r.resolved++
 	r.mu.Unlock()
+	f.mu.Lock()
 	if f.part != nil {
 		_ = f.part.Close()
 		f.part = nil
 	}
+	f.mu.Unlock()
 	r.reg.FileStateUpdate(f.entry.ID, "error", msg)
 	r.reg.Emit("file-error", f.entry.RelPath, msg)
 	_ = r.ctrl.Send(protocol.MsgFileResult, 0, protocol.FileResult{FileID: f.entry.ID, Status: protocol.ResultError, Code: code, Msg: msg}.Encode())
@@ -1294,19 +1421,26 @@ func (r *Receiver) failFile(f *rxFile, code uint16, msg string) {
 func (r *Receiver) senderFileError(m protocol.FileResult) {
 	r.mu.Lock()
 	f := r.files[m.FileID]
+	closePart := false
 	if f != nil && !f.resolved && !f.errored {
 		f.errored = true
 		f.resolved = true
-		if f.part != nil {
-			_ = f.part.Close()
-			f.part = nil
-		}
+		closePart = true
 		r.report.Errors = append(r.report.Errors, FileError{Path: f.entry.RelPath, Code: m.Code, Msg: "sender: " + m.Msg})
 	} else if f == nil {
 		r.report.Errors = append(r.report.Errors, FileError{Path: fmt.Sprintf("file#%d", m.FileID), Code: m.Code, Msg: "sender: " + m.Msg})
 	}
 	r.resolved++
 	r.mu.Unlock()
+	if closePart {
+		// close under f.mu — absorbChunk synchronizes part access on it
+		f.mu.Lock()
+		if f.part != nil {
+			_ = f.part.Close()
+			f.part = nil
+		}
+		f.mu.Unlock()
+	}
 	r.reg.FileStateUpdate(m.FileID, "error", m.Msg)
 	r.kickCompletion()
 }
@@ -1315,11 +1449,13 @@ func (r *Receiver) senderFileError(m protocol.FileResult) {
 func (r *Receiver) commitFile(id uint32) {
 	r.mu.Lock()
 	f := r.files[id]
+	stale := f == nil || f.resolved || f.errored
 	r.mu.Unlock()
-	if f == nil || f.resolved || f.errored {
+	if stale {
 		return
 	}
 	f.mu.Lock()
+	f.claimsResolved = true
 	if !f.sc.Complete() {
 		f.mu.Unlock()
 		return // chunks are still coming
@@ -1328,13 +1464,38 @@ func (r *Receiver) commitFile(id uint32) {
 	r.queueFinalize(id)
 }
 
+// claimResult applies the sender's verdict on an adopted file's claims:
+// claims the sender rejected (and that have not arrived yet) are cleared,
+// so completion waits for exactly the chunks still in flight.
+func (r *Receiver) claimResult(m protocol.ClaimResult) {
+	r.mu.Lock()
+	f := r.files[m.FileID]
+	stale := f == nil || f.errored || f.resolved
+	r.mu.Unlock()
+	if stale || !f.adopted {
+		return
+	}
+	grid := f.entry.Grid()
+	f.mu.Lock()
+	for i := int64(0); i < grid.Count(); i++ {
+		if f.sc.Have(i) && !bitTest(m.Verified, i) && !f.arrived[i] {
+			f.sc.ClearHave(i)
+			f.dirty = true
+		}
+	}
+	f.claimsResolved = true
+	f.mu.Unlock()
+	r.maybeComplete(f, m.FileID)
+}
+
 // retryOrFail sends a ChunkRetry or escalates to a file error after three
 // attempts on the same chunk.
 func (r *Receiver) retryOrFail(hdr protocol.ChunkHeader, err error) {
 	r.mu.Lock()
 	f := r.files[hdr.FileID]
+	stale := f == nil || f.errored || f.resolved
 	r.mu.Unlock()
-	if f == nil || f.errored || f.resolved {
+	if stale {
 		return
 	}
 	f.mu.Lock()
@@ -1386,6 +1547,15 @@ func (r *Receiver) checkParents(rel string) error {
 	return nil
 }
 
+// saveSidecar writes f's sidecar to its correct meta path (the adopted
+// path override when set, else derived from the part path).
+func (r *Receiver) saveSidecar(f *rxFile) error {
+	if f.metaPath != "" {
+		return f.sc.SaveAtomicMeta(f.metaPath)
+	}
+	return f.sc.SaveAtomic(f.partPath)
+}
+
 // flushAllSidecars persists every dirty sidecar (graceful shutdown path).
 func (r *Receiver) flushAllSidecars() {
 	r.mu.Lock()
@@ -1397,7 +1567,21 @@ func (r *Receiver) flushAllSidecars() {
 	for _, f := range fs {
 		f.mu.Lock()
 		if f.dirty && f.part != nil && f.partPath != "" {
-			_ = f.sc.SaveAtomic(f.partPath)
+			// an adopted/rebuilt file whose claims the sender never
+			// resolved carries SELF-DERIVED hashes: persisting them as-is
+			// would let the next session Validate the sidecar and trust
+			// stale bytes it never verified. Drop every unverified claim
+			// (keep only chunks that actually arrived over the wire) so
+			// the next run re-requests them.
+			if f.adopted && !f.claimsResolved {
+				grid := f.entry.Grid()
+				for i := int64(0); i < grid.Count(); i++ {
+					if f.sc.Have(i) && !f.arrived[i] {
+						f.sc.ClearHave(i)
+					}
+				}
+			}
+			_ = r.saveSidecar(f)
 			f.dirty = false
 		}
 		f.mu.Unlock()
@@ -1440,8 +1624,13 @@ func (r *Receiver) abortParts() {
 		pp := f.partPath
 		f.mu.Unlock()
 		if pp != "" {
-			_ = os.Remove(pp)
-			_ = os.Remove(sidecar.MetaPathForPart(pp))
+			if f.metaPath != "" {
+				// adopted: pp IS the final file — never delete it, just the meta
+				_ = os.Remove(f.metaPath)
+			} else {
+				_ = os.Remove(pp)
+				_ = os.Remove(sidecar.MetaPathForPart(pp))
+			}
 		}
 	}
 }
@@ -1486,6 +1675,13 @@ func (r *Receiver) deleteExtraLocked() {
 		if keep[rel] {
 			return nil
 		}
+		// never delete resume state: our own part/meta files, or those a
+		// concurrent live session holds (senderFileError keeps partials
+		// for a re-run; unlinking a flocked part ENOENTs that session)
+		base := filepath.Base(p)
+		if strings.Contains(base, sidecar.PartPrefix) || strings.Contains(base, sidecar.MetaPrefix) {
+			return nil
+		}
 		doomed = append(doomed, p)
 		return nil
 	})
@@ -1497,7 +1693,9 @@ func (r *Receiver) deleteExtraLocked() {
 		} else {
 			rel, _ := filepath.Rel(r.root, p)
 			r.reg.Emit("info", filepath.ToSlash(rel), "deleted (not in source)")
+			r.mu.Lock()
 			r.report.Warnings = append(r.report.Warnings, "deleted: "+rel)
+			r.mu.Unlock()
 		}
 	}
 }
@@ -1598,6 +1796,26 @@ func hexHash(h [32]byte) string {
 		out[i*2+1] = hexd[b&0xF]
 	}
 	return string(out)
+}
+
+// writeZeros writes n zero bytes at off using a shared 64KiB scratch
+// block, avoiding a per-chunk 16MiB allocation.
+var zeroBlock = make([]byte, 64<<10)
+
+func writeZeros(f *os.File, off, n int64) error {
+	for n > 0 {
+		w := int64(len(zeroBlock))
+		if n < w {
+			w = n
+		}
+		m, err := f.WriteAt(zeroBlock[:w], off)
+		if err != nil {
+			return err
+		}
+		off += int64(m)
+		n -= int64(m)
+	}
+	return nil
 }
 
 func copyFileLocal(src, dst string) error {
