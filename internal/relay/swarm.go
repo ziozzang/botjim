@@ -24,7 +24,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +41,9 @@ const (
 	announceEvery = 15 * time.Second
 	peerTTL       = 60 * time.Second
 	maxRoomPeers  = 256
+	// maxAnnounceReturn caps how many peers a single announce hands back —
+	// a random subset (seeds always included) for load/knowledge spread.
+	maxAnnounceReturn = 64
 )
 
 // Peer is one swarm member as the tracker sees it.
@@ -129,13 +131,24 @@ func (t *Tracker) Announce(roomID, addr, have string, seed bool) []Peer {
 		}
 		room[addr] = &Peer{Addr: addr, Have: have, IsSeed: seed, Seen: now}
 	}
-	out := make([]Peer, 0, len(room))
+	// return a subset (seeds always included) so a large swarm spreads
+	// load and knowledge instead of every joiner learning the same full
+	// address-sorted list. Map iteration order is randomized by the
+	// runtime, so successive announces hand out different non-seed peers.
+	out := make([]Peer, 0, maxAnnounceReturn)
 	for _, p := range room {
-		if p.Addr != addr {
+		if p.Addr != addr && p.IsSeed {
 			out = append(out, *p)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Addr < out[j].Addr })
+	for _, p := range room {
+		if len(out) >= maxAnnounceReturn {
+			break
+		}
+		if p.Addr != addr && !p.IsSeed {
+			out = append(out, *p)
+		}
+	}
 	return out
 }
 

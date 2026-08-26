@@ -261,17 +261,15 @@ func (j *Joiner) Run(ctx context.Context) error {
 	// captured peer list never grows
 	go j.reannounceLoop(ctx)
 
-	// order rarest-first (fewest peers hold it → fetch early so it
-	// propagates widest)
-	tasks = orderRarestFirst(tasks, j.Spec, peers)
 	if j.OnProgress != nil {
 		j.OnProgress(0, total)
 	}
 
-	// fetch workers over a shared task queue
+	// live piece-picker: rarest-first re-prioritized from the current peer
+	// set, endgame duplication of the tail, per-chunk retry
+	pk := newPicker(tasks)
 	fctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	taskCh := make(chan chunkTask, 64)
 	var wg sync.WaitGroup
 	var errOnce sync.Once
 	var fatal error
@@ -283,38 +281,58 @@ func (j *Joiner) Run(ctx context.Context) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for t := range taskCh {
+			for {
 				if fctx.Err() != nil {
+					return
+				}
+				peers := j.peersSnapshot()
+				t, ok, _ := pk.pick(chunkRarity(j.Spec, peers))
+				if !ok {
+					if pk.allDone() {
+						return
+					}
+					// nothing to pick right now (waiting on retries / all
+					// in flight) — brief pause, then re-poll
+					select {
+					case <-fctx.Done():
+						return
+					case <-time.After(50 * time.Millisecond):
+					}
 					continue
 				}
 				f := j.Spec.Files[t.file]
 				grid := chunking.Grid{Size: f.Size, ChunkSize: chunking.ChunkSizeFor(f.Size)}
-				data, err := j.fetchWithRetry(fctx, j.peersSnapshot(), f, t.file, t.chunk)
+				data, err := j.fetchWithRetry(fctx, peers, f, t.file, t.chunk)
 				if err != nil {
-					errOnce.Do(func() { fatal = fmt.Errorf("%s chunk %d: %w", f.Path, t.chunk, err); cancel() })
+					if pk.fail(t) {
+						errOnce.Do(func() {
+							fatal = fmt.Errorf("%s chunk %d: %w", f.Path, t.chunk, err)
+							cancel()
+						})
+					}
 					continue
 				}
-				if err := j.writeChunk(f, grid, t.chunk, data); err != nil {
-					errOnce.Do(func() { fatal = fmt.Errorf("%s chunk %d: %w", f.Path, t.chunk, err); cancel() })
-					continue
-				}
-				j.mu.Lock()
-				done += grid.Len(t.chunk)
-				d := done
-				j.mu.Unlock()
-				if j.OnProgress != nil {
-					j.OnProgress(d, total)
+				// first worker to complete this piece writes it; a losing
+				// endgame duplicate discards its bytes
+				if pk.complete(t) {
+					if err := j.writeChunk(f, grid, t.chunk, data); err != nil {
+						errOnce.Do(func() {
+							fatal = fmt.Errorf("%s chunk %d: %w", f.Path, t.chunk, err)
+							cancel()
+						})
+						continue
+					}
+					j.mu.Lock()
+					done += grid.Len(t.chunk)
+					d := done
+					j.mu.Unlock()
+					if j.OnProgress != nil {
+						j.OnProgress(d, total)
+					}
 				}
 			}
 		}()
 	}
-	for _, t := range tasks {
-		select {
-		case taskCh <- t:
-		case <-fctx.Done():
-		}
-	}
-	close(taskCh)
 	wg.Wait()
 	if fatal != nil {
 		return fatal
@@ -602,13 +620,12 @@ func (j *Joiner) ServeListenAddr() string {
 // orderRarestFirst sorts tasks ascending by how many peers hold each
 // chunk (from announce bitmaps): the scarcest chunks move first so they
 // propagate widest; common chunks mop up at the end.
-func orderRarestFirst(tasks []chunkTask, spec *SwarmSpec, peers []Peer) []chunkTask {
-	if len(peers) == 0 {
-		return tasks
-	}
-	// decode each peer's per-file bitmaps
-	type key struct{ f, c int64 }
-	rarity := map[key]int{}
+type rarityKey struct{ f, c int64 }
+
+// chunkRarity counts, per (file,chunk), how many peers advertise it — the
+// piece-picker fetches the scarcest first so rare pieces propagate widest.
+func chunkRarity(spec *SwarmSpec, peers []Peer) map[rarityKey]int {
+	rarity := map[rarityKey]int{}
 	for _, p := range peers {
 		perFile := strings.Split(p.Have, "/")
 		for fi := range spec.Files {
@@ -621,13 +638,21 @@ func orderRarestFirst(tasks []chunkTask, spec *SwarmSpec, peers []Peer) []chunkT
 			}
 			for ci := 0; ci < len(bm)*8; ci++ {
 				if bm[ci/8]&(1<<(uint(ci)%8)) != 0 {
-					rarity[key{int64(fi), int64(ci)}]++
+					rarity[rarityKey{int64(fi), int64(ci)}]++
 				}
 			}
 		}
 	}
+	return rarity
+}
+
+func orderRarestFirst(tasks []chunkTask, spec *SwarmSpec, peers []Peer) []chunkTask {
+	if len(peers) == 0 {
+		return tasks
+	}
+	rarity := chunkRarity(spec, peers)
 	sort.SliceStable(tasks, func(a, b int) bool {
-		return rarity[key{tasks[a].file, tasks[a].chunk}] < rarity[key{tasks[b].file, tasks[b].chunk}]
+		return rarity[rarityKey{tasks[a].file, tasks[a].chunk}] < rarity[rarityKey{tasks[b].file, tasks[b].chunk}]
 	})
 	return tasks
 }

@@ -209,6 +209,20 @@ dest flock refuses a second `swarm join` into the same directory. Serve
 connections are capped (`maxServeConns`) so a popular node is not
 connection-stormed — at capacity it refuses fast and the fetcher
 re-routes to another peer.
+
+**Piece-picking (v0.13).** A live picker replaces fetch-once ordering:
+each worker asks for the rarest still-pending chunk computed from the
+*current* peer availability (re-announced every 15s), so pieces that turn
+scarce mid-download are prioritized. An **endgame** mode covers the tail —
+when nothing is pending but pieces are still in flight, a free worker
+duplicates an outstanding piece across another peer and the first verified
+copy wins, so one slow peer cannot stall the download at 99%. Each chunk
+retries independently (a failed round returns it to the pending set — a
+peer may appear via re-announce) and escalates to a fatal error only after
+failing from every source repeatedly. The tracker hands each announce a
+random subset of the room (seeds always included), so a large swarm
+spreads load and knowledge instead of every joiner learning the same list.
+
 Descriptors can be **ed25519-signed** (`swarm keygen`); joiners pin the
 signer with `--verify-key` so a swapped or tampered spec fails closed.
 
