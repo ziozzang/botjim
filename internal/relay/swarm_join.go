@@ -144,16 +144,49 @@ func (j *Joiner) peersSnapshot() []Peer {
 // reannounceLoop refreshes the joiner's tracker TTL every announceEvery
 // and merges any newly-joined peers into the live set, so a multi-minute
 // download neither expires from its room nor stays blind to later peers.
+// availCount totals serveable chunks across all files (progress signal).
+func (j *Joiner) availCount() int {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	n := 0
+	for _, bm := range j.avail {
+		for _, b := range bm {
+			if b {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// reannounceLoop refreshes the tracker TTL and — crucially for a live mesh
+// — re-announces SOON after new pieces land (not just every 15s), so peers
+// learn what we can serve while a download is still in progress. It polls
+// on a short tick: it announces when our piece count grew (bounded to at
+// most once per minReannounce), and unconditionally every announceEvery to
+// keep the room TTL fresh and pick up newly-joined peers.
 func (j *Joiner) reannounceLoop(ctx context.Context) {
+	const minReannounce = 1 * time.Second
+	tick := time.NewTicker(500 * time.Millisecond)
+	defer tick.Stop()
+	lastCount := -1
+	lastAnnounce := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(announceEvery):
+		case <-tick.C:
 		}
-		peers := j.announce(ctx, j.catalog())
-		if len(peers) > 0 {
-			j.setPeers(peers)
+		cur := j.availCount()
+		grew := cur != lastCount
+		since := time.Since(lastAnnounce)
+		if (grew && since >= minReannounce) || since >= announceEvery {
+			peers := j.announce(ctx, j.catalog())
+			if len(peers) > 0 {
+				j.setPeers(peers)
+			}
+			lastCount = cur
+			lastAnnounce = time.Now()
 		}
 	}
 }
