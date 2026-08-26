@@ -60,4 +60,17 @@ done
   chmod 0644 SHA256SUMS
 )
 
+# sign SHA256SUMS with the release ed25519 key so `botjim update` can verify
+# authenticity (not just integrity). RELEASE_KEY points at the hex private
+# key; it must NEVER be committed. Without it the release is unsigned and
+# a signed-build client (embedded pubkey) will refuse to self-update to it.
+RELEASE_KEY="${RELEASE_KEY:-${HOME}/.botjim/keys/release-ed25519}"
+if [[ -f "${RELEASE_KEY}" ]]; then
+  go run "${ROOT_DIR}/scripts/sign-sums.go" "${RELEASE_KEY}" "${DIST_DIR}/SHA256SUMS" "${DIST_DIR}/SHA256SUMS.sig"
+  chmod 0644 "${DIST_DIR}/SHA256SUMS.sig"
+  echo "signed SHA256SUMS -> SHA256SUMS.sig"
+else
+  echo "WARNING: ${RELEASE_KEY} not found — release will be UNSIGNED; signed clients will refuse it" >&2
+fi
+
 echo "release binaries written to ${DIST_DIR}"

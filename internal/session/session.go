@@ -33,7 +33,7 @@ import (
 // Wire the record-layer hooks once: every botjim process (and test) that
 // uses sessions gets --pass encryption via the relay's proven construction.
 func init() {
-	transport.CipherFactory = relay.EncryptConn
+	transport.CipherFactory = relay.EncryptConnBound
 	transport.PassphraseSecret = relay.PassphraseSecret
 }
 

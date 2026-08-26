@@ -143,19 +143,31 @@ tamper (detected — AEAD). It cannot: read content, decrypt later, forge a
 peer, or reuse a code. A code shared over a compromised channel loses
 confidentiality to that eavesdropper — share it out-of-band.
 
-## Direct-mode security (v0.3+)
+## Direct-mode security (v0.3+; auth v2 in v0.11)
 
 The relay's record layer was generalized into hooks the plain path can
-use; direct mode now has three opt-in layers, each independent:
+use; direct mode has three opt-in layers, each independent:
 
-- **`--token`** — after the FSY1 handshake the client proves knowledge of
-  the shared secret with an HMAC over a transcript binding both nonces
-  and the role; comparison is constant-time. A passive listener without
-  the token cannot progress past the proof.
-- **`--pass`** — X25519 with an HKDF schedule that stretches the
-  passphrase (scrypt) as a PSK; both sides verify confirmation MACs
-  before any protocol byte. From then on the session — including the
-  token proof — rides the ChaCha20-Poly1305 record layer.
+- **`--token`** — a shared secret. **As of v0.11 the token drives the
+  X25519 record layer** (secret = `SHA-256("botjim-token-psk/v2/"+token)`):
+  a token session is now fully encrypted and authenticated, not merely a
+  proof of knowledge. (Before v0.11 the token was an HMAC proof and the
+  data stream that followed was plaintext unless `--pass` was also set —
+  the v2 change closes that.) Both ends must be v0.11+; a pre-v0.11 peer
+  is refused cleanly (unknown `SecureV2` handshake flag).
+- **`--pass`** — a passphrase, scrypt-stretched into the same X25519
+  record-layer PSK. Combining `--token --pass` requires the peer to know
+  **both** (the two PSKs are concatenated into the key schedule).
+- **Handshake binding (v0.11)** — the record layer's HKDF schedule and
+  confirmation MAC now fold in the canonical bytes of *both* peers'
+  36-byte FSY1 handshakes. Since those carry the feature bits and flags, a
+  man-in-the-middle who strips a feature bit (e.g. the per-chunk checksum)
+  or alters any handshake field produces a different key on each side and
+  the session fails to establish — closing the plaintext-handshake
+  downgrade gap. Both sides derive identical bind bytes via a sorted
+  (order-independent) concatenation.
+- Both `--token` and `--pass` verify ChaCha20-Poly1305 confirmation MACs
+  before any protocol byte flows.
 - **`--cloak PATH`** — the TCP stream is shaped as HTTP: a plain GET to
   any other path gets a plausible decoy page; the right path upgrades to
   a WebSocket (101 + `Sec-WebSocket-Accept` verified) and the real
@@ -273,8 +285,23 @@ the engine's token/encryption.
   suite (random interruption points × N), docker container E2E
 - `-race` across all packages; benchmarks against `tar | nc`
 
+## Self-update authenticity (v0.11)
+
+`botjim update` verifies a detached ed25519 signature (`SHA256SUMS.sig`)
+over the release's `SHA256SUMS` against a public key embedded in the
+binary (`selfupdate.ReleasePubKeyHex`) before trusting any checksum. The
+signing private key lives only on the maintainer's machine and is never in
+the repo (`scripts/build-release.sh` signs with `$RELEASE_KEY`). A signed
+build refuses a release whose signature is missing or does not verify, so a
+compromised release or forged TLS certificate cannot push a malicious
+binary — the per-binary SHA-256 then guards the download's integrity. A
+build with an empty embedded key (local/dev) falls back to checksum-only.
+
 ## Versioning
 
 Semver. The wire protocol major (`FSY1` → `FSY2`) changes only
 incompatibly; feature bits negotiate everything else. Sidecars and part
-files embed the format version.
+files embed the format version. The v0.11 auth-v2 change (token/pass →
+record layer, handshake binding) is guarded by the `SecureV2` handshake
+flag: mixed old/new peers refuse cleanly rather than falling back to a
+weaker mode.

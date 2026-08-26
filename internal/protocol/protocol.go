@@ -43,6 +43,14 @@ const (
 const (
 	HSFlagToken = 1 << 0 // --token auth follows the handshake
 	HSFlagPass  = 1 << 1 // --pass record-layer encryption follows
+	// HSFlagSecureV2 marks the v2 auth layer: token and/or pass both run
+	// through the X25519 record layer (token is no longer a bare HMAC), and
+	// the confirmation MAC binds the full handshake of both peers (so a
+	// feature-bit / flag downgrade by a man in the middle breaks the
+	// session). Set whenever token or pass is in use. A pre-v0.11 peer
+	// rejects this unknown flag outright — a clean refusal, not a silent
+	// downgrade.
+	HSFlagSecureV2 = 1 << 2
 )
 
 // Handshake feature bits, exchanged as a u64 in the handshake. The effective
@@ -118,6 +126,22 @@ func WriteHandshake(w io.Writer, h *Handshake) error {
 	return err
 }
 
+// MarshalHandshake returns the exact 36 wire bytes of h (magic, fields,
+// nonce, trailing CRC) — the canonical form the v2 auth layer binds into
+// its confirmation MAC so any handshake tampering is detected.
+func MarshalHandshake(h *Handshake) [36]byte {
+	var buf [36]byte
+	copy(buf[0:4], Magic)
+	buf[4] = h.ProtoMajor
+	buf[5] = h.ProtoMinor
+	buf[6] = h.CipherID
+	buf[7] = h.Flags
+	binary.LittleEndian.PutUint64(buf[8:16], h.FeatureBits)
+	copy(buf[16:32], h.Nonce[:])
+	binary.LittleEndian.PutUint32(buf[32:36], crc32.Checksum(buf[:32], crc32c))
+	return buf
+}
+
 // ReadHandshake reads and validates a handshake frame. Magic, CRC and major
 // version mismatches are hard errors.
 func ReadHandshake(r io.Reader) (*Handshake, error) {
@@ -137,7 +161,7 @@ func ReadHandshake(r io.Reader) (*Handshake, error) {
 	if buf[6] != CipherPlain {
 		return nil, fmt.Errorf("unsupported cipher id %d (this build speaks plaintext only)", buf[6])
 	}
-	if buf[7]&^(uint8(HSFlagToken|HSFlagPass)) != 0 {
+	if buf[7]&^(uint8(HSFlagToken|HSFlagPass|HSFlagSecureV2)) != 0 {
 		return nil, fmt.Errorf("unsupported handshake flags %#x", buf[7])
 	}
 	h := &Handshake{

@@ -7,7 +7,7 @@ import (
 )
 
 func init() {
-	transport.CipherFactory = relay.EncryptConn
+	transport.CipherFactory = relay.EncryptConnBound
 	transport.PassphraseSecret = relay.PassphraseSecret
 	transport.CloakDialer = cloak.Dial
 	transport.CloakSniff = cloak.SniffCloaked

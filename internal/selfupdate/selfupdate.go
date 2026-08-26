@@ -3,17 +3,19 @@
 // checked against the SHA-256 recorded in the release's SHA256SUMS asset
 // before it replaces the running executable.
 //
-// Trust model: the checksum protects against corruption and truncation.
-// It is NOT a signature — SHA256SUMS is fetched from the same release over
-// TLS, so authenticity rests on transport security plus the integrity of
-// the GitHub release itself. A compromised release (or CA) could serve a
-// malicious binary with a matching SHA256SUMS. A detached signature over
-// SHA256SUMS verified against an embedded public key would close that gap;
-// it is not yet implemented.
+// Trust model: SHA256SUMS is signed with the release maintainer's ed25519
+// key and verified here against ReleasePubKeyHex embedded in the binary.
+// A signed build refuses any release whose SHA256SUMS.sig is missing or
+// does not verify, so a compromised release or a forged TLS cert cannot
+// push a malicious binary — the attacker would also need the release
+// private key, which never leaves the maintainer's machine. The per-binary
+// SHA-256 check then guards integrity of the download itself. A build with
+// an empty ReleasePubKeyHex (development) falls back to checksum-only.
 package selfupdate
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -29,6 +31,37 @@ import (
 
 // DefaultAPIBase is the GitHub REST API root.
 const DefaultAPIBase = "https://api.github.com"
+
+// ReleasePubKeyHex is the ed25519 public key that signs SHA256SUMS. The
+// matching private key lives only on the release maintainer's machine
+// (never in the repo). An empty value disables signature enforcement
+// (development builds); a set value makes a valid SHA256SUMS.sig mandatory
+// — this is what raises self-update from "corruption-resistant" to
+// "authenticity-checked", closing the compromised-release / MITM gap.
+const ReleasePubKeyHex = "9c68be24cadfb63e234c5c64f8bf32a48c06d04593ac61f250c373cc30883a39"
+
+// SigAssetName is the detached signature over SHA256SUMS.
+const SigAssetName = "SHA256SUMS.sig"
+
+// verifyChecksumsSig checks sig (raw ed25519 signature bytes) over body
+// against the embedded release key. Returns nil when no key is embedded
+// (dev build) — the caller then proceeds on the SHA-256 alone.
+func verifyChecksumsSig(body, sig []byte) error {
+	if ReleasePubKeyHex == "" {
+		return nil // unsigned dev build: checksum-only (documented)
+	}
+	pub, err := hex.DecodeString(ReleasePubKeyHex)
+	if err != nil || len(pub) != ed25519.PublicKeySize {
+		return fmt.Errorf("selfupdate: bad embedded release key")
+	}
+	if len(sig) != ed25519.SignatureSize {
+		return fmt.Errorf("selfupdate: bad SHA256SUMS signature length %d", len(sig))
+	}
+	if !ed25519.Verify(pub, body, sig) {
+		return fmt.Errorf("selfupdate: SHA256SUMS signature does not verify against the release key — refusing (possible tampered or forged release)")
+	}
+	return nil
+}
 
 // Release is the subset of a GitHub release botjim consumes.
 type Release struct {
@@ -179,6 +212,26 @@ func Checksums(ctx context.Context, client *http.Client, rel *Release) (map[stri
 	body, err := download(ctx, client, asset.URL, 1<<20)
 	if err != nil {
 		return nil, err
+	}
+	// authenticity: the sums are only trustworthy if signed by the release
+	// key. A signed build REQUIRES the signature asset; a dev build
+	// (empty embedded key) skips this.
+	if ReleasePubKeyHex != "" {
+		sigAsset, ok := rel.FindAsset(SigAssetName)
+		if !ok {
+			return nil, fmt.Errorf("release %s has no %s (unsigned release; refusing)", rel.TagName, SigAssetName)
+		}
+		sigHex, err := download(ctx, client, sigAsset.URL, 4<<10)
+		if err != nil {
+			return nil, err
+		}
+		sig, err := hex.DecodeString(strings.TrimSpace(string(sigHex)))
+		if err != nil {
+			return nil, fmt.Errorf("selfupdate: %s is not hex: %w", SigAssetName, err)
+		}
+		if err := verifyChecksumsSig(body, sig); err != nil {
+			return nil, err
+		}
 	}
 	sums := map[string]string{}
 	for _, line := range strings.Split(string(body), "\n") {

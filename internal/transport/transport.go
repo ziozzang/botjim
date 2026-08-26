@@ -7,7 +7,9 @@ package transport
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -105,6 +107,9 @@ func (o SecOpts) flags() uint8 {
 	if o.Pass != "" {
 		f |= protocol.HSFlagPass
 	}
+	if f != 0 {
+		f |= protocol.HSFlagSecureV2 // token/pass always use the v2 layer
+	}
 	return f
 }
 
@@ -149,9 +154,10 @@ func DialConn(raw net.Conn, features uint64, cipher CipherFunc) (*Session, error
 	return DialConnSec(raw, features, cipher, SecOpts{})
 }
 
-// CipherFactory builds the record layer from a shared secret; the relay
+// CipherFactory builds the record layer from a shared secret plus bind
+// (canonical handshake bytes, folded into the transcript); the relay
 // package installs its implementation, keeping transport dependency-free.
-var CipherFactory func(raw net.Conn, secret []byte, initiator bool) (net.Conn, error)
+var CipherFactory func(raw net.Conn, secret, bind []byte, initiator bool) (net.Conn, error)
 
 // PassphraseSecret stretches a passphrase into a PSK (both sides derive
 // the same bytes; per-session randomness comes from the record-layer
@@ -267,9 +273,18 @@ func AcceptConnSec(raw net.Conn, features uint64, cipher CipherFunc, sec SecOpts
 // (possibly wrapped) connection: token proof first, then the passphrase
 // record layer, which must wrap before yamux so even the multiplexed
 // headers are ciphertext.
+// secureConn runs the post-handshake auth/encryption layer. In v2, token
+// and/or pass both drive the X25519 record layer (token is no longer a
+// bare HMAC — it now encrypts and authenticates the whole stream), and the
+// full handshake of both peers is bound into the key schedule so a MITM
+// cannot downgrade feature bits or flags undetected.
 func secureConn(raw net.Conn, mine, theirs *protocol.Handshake, sec SecOpts, client bool) (net.Conn, error) {
 	wantToken := mine.Flags&protocol.HSFlagToken != 0
 	gotToken := theirs.Flags&protocol.HSFlagToken != 0
+	wantPass := mine.Flags&protocol.HSFlagPass != 0
+	gotPass := theirs.Flags&protocol.HSFlagPass != 0
+
+	// each layer must be requested by BOTH sides (mismatch = clear refusal)
 	switch {
 	case wantToken && !gotToken:
 		if client {
@@ -282,31 +297,71 @@ func secureConn(raw net.Conn, mine, theirs *protocol.Handshake, sec SecOpts, cli
 		}
 		return nil, fmt.Errorf("client sent --token but this server has none")
 	}
-	if wantToken {
-		if err := TokenAuth(raw, mine, theirs, sec.Token, client); err != nil {
-			return nil, err
-		}
-	}
-	// passphrase: both sides must agree
-	wantPass := mine.Flags&protocol.HSFlagPass != 0
-	gotPass := theirs.Flags&protocol.HSFlagPass != 0
 	if wantPass != gotPass {
 		if wantPass {
-			return nil, fmt.Errorf("encryption required: client connected in plaintext")
+			return nil, fmt.Errorf("encryption required: peer connected without --pass")
 		}
-		return nil, fmt.Errorf("client wants encryption but this server has no --pass")
+		return nil, fmt.Errorf("peer wants --pass encryption but this side has none")
 	}
-	if wantPass {
-		if CipherFactory == nil || PassphraseSecret == nil {
+
+	if !wantToken && !wantPass {
+		return raw, nil // plaintext (trusted network) — unchanged
+	}
+
+	// v2 required on both ends. A pre-v0.11 peer never sets SecureV2 (and
+	// in fact rejects our SecureV2 flag as unknown before reaching here), so
+	// a missing bit means an incompatible/downgraded peer: refuse.
+	if mine.Flags&protocol.HSFlagSecureV2 == 0 || theirs.Flags&protocol.HSFlagSecureV2 == 0 {
+		return nil, fmt.Errorf("secure auth v2 required — upgrade both ends to v0.11+")
+	}
+	if CipherFactory == nil {
+		return nil, fmt.Errorf("encryption unavailable (build missing record layer)")
+	}
+	secret, err := authSecret(sec)
+	if err != nil {
+		return nil, err
+	}
+	// bind the canonical bytes of BOTH handshakes (order-independent): any
+	// alteration to either peer's feature bits/flags/nonce fails the MAC
+	mh := protocol.MarshalHandshake(mine)
+	th := protocol.MarshalHandshake(theirs)
+	bind := handshakeBind(mh[:], th[:])
+	wrapped, err := CipherFactory(raw, secret, bind, client)
+	if err != nil {
+		return nil, fmt.Errorf("secure handshake: %w", err)
+	}
+	return wrapped, nil
+}
+
+// authSecret derives the record-layer PSK from the requested layers. Token
+// and pass each contribute keyed material; when both are set the peer must
+// know both. Order is fixed so both sides derive identical bytes.
+func authSecret(sec SecOpts) ([]byte, error) {
+	var out []byte
+	if sec.Token != "" {
+		h := sha256.Sum256([]byte("botjim-token-psk/v2/" + sec.Token))
+		out = append(out, h[:]...)
+	}
+	if sec.Pass != "" {
+		if PassphraseSecret == nil {
 			return nil, fmt.Errorf("encryption unavailable (build missing record layer)")
 		}
-		wrapped, err := CipherFactory(raw, PassphraseSecret(sec.Pass), client)
-		if err != nil {
-			return nil, fmt.Errorf("encryption: %w", err)
-		}
-		return wrapped, nil
+		out = append(out, PassphraseSecret(sec.Pass)...)
 	}
-	return raw, nil
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no auth secret")
+	}
+	return out, nil
+}
+
+// handshakeBind returns the two handshakes concatenated in canonical
+// (sorted) order, so both peers compute identical bind bytes regardless of
+// role.
+func handshakeBind(a, b []byte) []byte {
+	if bytes.Compare(b, a) < 0 {
+		a, b = b, a
+	}
+	return append(append([]byte(nil), a...), b...)
 }
 
 // readHandshakeStrict reads the peer's handshake and performs a hard

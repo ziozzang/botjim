@@ -40,17 +40,26 @@ type e2eeKeys struct {
 // X25519 exchange. Direct mode (--pass) and swarm links reuse this with
 // secret material derived from a passphrase or swarm token.
 func EncryptConn(conn net.Conn, secret []byte, initiator bool) (net.Conn, error) {
-	return handshakeV1Secret(conn, secret, initiator)
+	return handshakeV1Bound(conn, secret, nil, initiator)
+}
+
+// EncryptConnBound is EncryptConn with extra transcript-binding data
+// (bind) folded into the key schedule and confirmation MAC. The transport
+// layer passes the canonical bytes of both peers' handshakes here, so a
+// man-in-the-middle who alters any handshake field (feature bits, flags)
+// breaks confirmation. Both peers must supply identical bind bytes.
+func EncryptConnBound(conn net.Conn, secret, bind []byte, initiator bool) (net.Conn, error) {
+	return handshakeV1Bound(conn, secret, bind, initiator)
 }
 
 // handshakeV1 performs the PSK-authenticated key exchange over the paired
 // pipe. initiator is the offering (sending) side. On success the returned
 // conn encrypts everything in both directions.
 func handshakeV1(conn net.Conn, code string, initiator bool) (net.Conn, error) {
-	return handshakeV1Secret(conn, []byte("botjim-relay-psk/v1/"+NormalizeCode(code)), initiator)
+	return handshakeV1Bound(conn, []byte("botjim-relay-psk/v1/"+NormalizeCode(code)), nil, initiator)
 }
 
-func handshakeV1Secret(conn net.Conn, psk []byte, initiator bool) (net.Conn, error) {
+func handshakeV1Bound(conn net.Conn, psk, bind []byte, initiator bool) (net.Conn, error) {
 	// ephemeral X25519
 	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
@@ -90,7 +99,10 @@ func handshakeV1Secret(conn net.Conn, psk []byte, initiator bool) (net.Conn, err
 	// identical output, so anything side-dependent enters only through the
 	// (symmetric) confirmation transcript below.
 	ikm := append(append([]byte{}, shared...), psk...)
-	info := []byte(e2eeVersion)
+	// bind (the transport's canonical handshake bytes) enters the key
+	// schedule: a MITM that altered a handshake field yields a different
+	// key on each side and the first record fails to open
+	info := append([]byte(e2eeVersion), bind...)
 	var okm [64]byte
 	if _, err := io.ReadFull(hkdf.New(sha256.New, ikm, nil, info), okm[:]); err != nil {
 		return nil, err
@@ -105,7 +117,7 @@ func handshakeV1Secret(conn net.Conn, psk []byte, initiator bool) (net.Conn, err
 	if bytes.Compare(peerHello[:], hello[:]) < 0 {
 		h1, h2 = peerHello, hello
 	}
-	transcript := append(append([]byte(e2eeVersion), h1[:]...), h2[:]...)
+	transcript := append(append(append([]byte(e2eeVersion), h1[:]...), h2[:]...), bind...)
 	confirmKey := hkdfSum([]byte("confirm"), ikm, transcript)
 	mine := hmacSum(confirmKey, []byte(roleTag(initiator)))
 	theirs := hmacSum(confirmKey, []byte(roleTag(!initiator)))
