@@ -515,10 +515,14 @@ func (r *Receiver) prepareRegular(ctx context.Context, e manifest.Entry) {
 		return
 	}
 
+	// stat the destination ONCE and branch on it (was two Lstats per file)
+	dstFI, dstErr := os.Lstat(abs)
+	dstRegular := dstErr == nil && dstFI.Mode().IsRegular()
+
 	// already-complete shortcut (size + mtime)
-	if fi, err := os.Lstat(abs); err == nil && fi.Mode().IsRegular() {
-		mtimeOK := r.opts.Resume == 1 || fi.ModTime().Equal(time.Unix(e.Mtime.Sec, int64(e.Mtime.Nsec)))
-		if fi.Size() == e.Size && mtimeOK && r.opts.Resume != 2 {
+	if dstRegular {
+		mtimeOK := r.opts.Resume == 1 || dstFI.ModTime().Equal(time.Unix(e.Mtime.Sec, int64(e.Mtime.Nsec)))
+		if dstFI.Size() == e.Size && mtimeOK && r.opts.Resume != 2 {
 			r.sendHave(e.ID, protocol.HaveAllSkip, nil)
 			r.reg.AddSkipped(e.Size)
 			r.reg.FileStateUpdate(e.ID, "skipped", "")
@@ -530,7 +534,7 @@ func (r *Receiver) prepareRegular(ctx context.Context, e manifest.Entry) {
 
 	// delta: a same-size final with a different mtime becomes its own part —
 	// its chunks are re-hashed and only the differing ones arrive in place
-	if fi, err := os.Lstat(abs); err == nil && fi.Mode().IsRegular() && fi.Size() == e.Size && grid.Count() > 0 && r.opts.Resume != 2 {
+	if dstRegular && dstFI.Size() == e.Size && grid.Count() > 0 && r.opts.Resume != 2 {
 		if r.adoptFinalAsPart(abs, e, grid) {
 			return
 		}
@@ -1163,9 +1167,13 @@ func (r *Receiver) finalize(id uint32) {
 			return
 		}
 	}
+	// a fresh single-pass file never wrote a sidecar (finalize skips the
+	// write, and flushAllSidecars only runs on interrupt), so there is
+	// nothing to remove — skip the Remove syscall entirely. Only a
+	// resumed/adopted file (mayStale) may have one on disk.
 	if f.metaPath != "" {
 		_ = os.Remove(f.metaPath)
-	} else {
+	} else if f.mayStale {
 		_ = os.Remove(sidecar.MetaPathForPart(f.partPath))
 	}
 	r.forgetParts(f.abs, filepath.Base(f.partPath))

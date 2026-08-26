@@ -43,7 +43,15 @@ type DataStream struct {
 	conn io.ReadWriter
 	br   *bufio.Reader
 	buf  []byte // read-side payload scratch
+	wbuf []byte // write-side scratch: coalesce header+payload into one write
 }
+
+// coalesceLimit bounds when a chunk frame is written as a single buffer
+// (header+payload copied together) vs two writes. Small payloads (the
+// common many-small-files case) are cheaper to copy than to split into two
+// yamux frames; large payloads are written in two calls to avoid a 16MiB
+// memcpy that would cost more than the saved frame.
+const coalesceLimit = 128 << 10
 
 // NewDataStream wraps a freshly opened stream after exchanging the kind
 // hello. index is diagnostic (which worker owns the stream).
@@ -96,6 +104,16 @@ func (s *DataStream) WriteChunk(h ChunkHeader, payload []byte) error {
 	hdr[n] = h.Flags
 	n++
 	n += binary.PutUvarint(hdr[n:], h.PayloadLen)
+	if len(payload) > 0 && len(payload) <= coalesceLimit {
+		// one write = one yamux frame; avoids the per-chunk header frame
+		if cap(s.wbuf) < n+len(payload) {
+			s.wbuf = make([]byte, 0, n+len(payload))
+		}
+		s.wbuf = append(s.wbuf[:0], hdr[:n]...)
+		s.wbuf = append(s.wbuf, payload...)
+		_, err := s.conn.Write(s.wbuf)
+		return err
+	}
 	if _, err := s.conn.Write(hdr[:n]); err != nil {
 		return err
 	}
@@ -180,6 +198,19 @@ func (s *DataStream) WriteChunkSummed(h ChunkHeader, body []byte) error {
 	hdr[n] = h.Flags
 	n++
 	n += binary.PutUvarint(hdr[n:], h.PayloadLen)
+	// the summed path always has a trailer, so coalescing saves two writes
+	// for small payloads (three yamux frames → one)
+	if len(body) <= coalesceLimit {
+		need := n + len(body) + 4
+		if cap(s.wbuf) < need {
+			s.wbuf = make([]byte, 0, need)
+		}
+		s.wbuf = append(s.wbuf[:0], hdr[:n]...)
+		s.wbuf = append(s.wbuf, body...)
+		s.wbuf = append(s.wbuf, tr[:]...)
+		_, err := s.conn.Write(s.wbuf)
+		return err
+	}
 	if _, err := s.conn.Write(hdr[:n]); err != nil {
 		return err
 	}
