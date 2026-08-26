@@ -123,6 +123,11 @@ func (s *Server) Serve(ln net.Listener) error {
 	}
 }
 
+// ServeConn runs one connection through the full server lifecycle —
+// handshake, per-connection engine, teardown. The relay receiver (`botjim
+// recv`) drives this directly on its paired pipe.
+func (s *Server) ServeConn(raw net.Conn) { s.handleConn(raw) }
+
 func (s *Server) handleConn(raw net.Conn) {
 	remote := raw.RemoteAddr().String()
 	sess, err := transport.Accept(raw, s.cfg.Features, nil)
@@ -351,7 +356,8 @@ func (s *Server) serveList(ctrl *protocol.CtrlStream, payload []byte) {
 // ClientConfig configures one client run.
 type ClientConfig struct {
 	Addr        string
-	Direction   uint8 // protocol.DirPush / DirPull
+	Conn        net.Conn // pre-paired connection (relay); Addr is display-only then
+	Direction   uint8    // protocol.DirPush / DirPull
 	Paths       []string
 	DestRoot    string // pull destination (client side)
 	Compression uint8
@@ -377,7 +383,13 @@ func RunTransfer(ctx context.Context, cfg ClientConfig) ClientResult {
 
 // RunWithProgress is RunTransfer with a caller-owned progress registry.
 func RunWithProgress(ctx context.Context, cfg ClientConfig, reg *progress.Registry) ClientResult {
-	sess, err := transport.Dial(ctx, cfg.Addr, protocol.FeatAll, nil)
+	var sess *transport.Session
+	var err error
+	if cfg.Conn != nil {
+		sess, err = transport.DialConn(cfg.Conn, protocol.FeatAll, nil)
+	} else {
+		sess, err = transport.Dial(ctx, cfg.Addr, protocol.FeatAll, nil)
+	}
 	if err != nil {
 		return ClientResult{Err: err}
 	}

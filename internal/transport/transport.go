@@ -78,11 +78,17 @@ func Dial(ctx context.Context, addr string, features uint64, cipher CipherFunc) 
 	if err != nil {
 		return nil, err
 	}
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = raw.SetDeadline(deadline)
-	} else {
-		_ = raw.SetDeadline(time.Now().Add(15 * time.Second))
+	return DialConn(raw, features, cipher)
+}
+
+// DialConn handshakes as the client over an already-established
+// connection (relay mode hands in a paired, encrypted conn here — so the
+// FSY1 handshake itself travels inside the record layer).
+func DialConn(raw net.Conn, features uint64, cipher CipherFunc) (*Session, error) {
+	if cipher == nil {
+		cipher = IdentityCipher
 	}
+	_ = raw.SetDeadline(time.Now().Add(15 * time.Second))
 	hs, err := protocol.NewHandshake(features)
 	if err != nil {
 		_ = raw.Close()
@@ -118,6 +124,11 @@ type HandshakeResult struct {
 
 // Accept handshakes one inbound connection (server side).
 func Accept(raw net.Conn, features uint64, cipher CipherFunc) (*Session, error) {
+	return AcceptConn(raw, features, cipher)
+}
+
+// AcceptConn is Accept for an already-established connection (relay).
+func AcceptConn(raw net.Conn, features uint64, cipher CipherFunc) (*Session, error) {
 	if cipher == nil {
 		cipher = IdentityCipher
 	}

@@ -1,13 +1,16 @@
 // Package cli parses botjim's command line and dispatches to the server,
-// client (push/pull), browser, update or version modes.
+// send/pull, update or version subcommands. Every command has its own
+// --help; the historical -s/-c flag forms still work as aliases.
 //
 // Usage:
 //
-//	botjim -s [flags]                          server (waits, dashboard)
-//	botjim -c HOST[:port] [PATH...]            push PATHs to the server
-//	botjim -c HOST[:port] --pull [RPATH...]    pull RPATHs from the server
-//	botjim -c HOST[:port]                      browser (pick & push/pull)
-//	botjim update [--check|--force|--version V]
+//	botjim server [flags]                        wait for transfers (dashboard)
+//	botjim send HOST[:port] [PATH...]            push PATHs to the server
+//	botjim pull HOST[:port] [RPATH...]           pull RPATHs from the server
+//	botjim send HOST[:port]                      no paths: MC-style picker
+//	botjim update [--check] [--force]            self-update from GitHub
+//	botjim version
+//	botjim help [command]
 package cli
 
 import (
@@ -18,26 +21,20 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
-	"time"
 
 	"github.com/ziozzang/botjim/internal/attrs"
-	"github.com/ziozzang/botjim/internal/compress"
-	"github.com/ziozzang/botjim/internal/fsutil"
-	"github.com/ziozzang/botjim/internal/protocol"
-	"github.com/ziozzang/botjim/internal/session"
-	"github.com/ziozzang/botjim/internal/transport"
 	"github.com/ziozzang/botjim/internal/version"
 )
 
 // DefaultPort is botjim's TCP port.
 const DefaultPort = 4761
 
-// flags is one parsed invocation.
+// flags is one parsed invocation. Commands fill the subset they own; the
+// shared transfer fields are registered by addTransferFlags.
 type flags struct {
 	server    bool
-	client    string
+	client    string // host[:port] (send/pull target)
 	port      int
 	bind      string
 	root      string
@@ -60,20 +57,33 @@ type flags struct {
 	probe     bool
 	logFile   string
 	rest      []string
+	via       string // relay address for --via transfers
+	code      string // relay pairing code
 }
 
-func parse(args []string) (*flags, error) {
-	f := &flags{}
-	fs := flag.NewFlagSet("botjim", flag.ContinueOnError)
+// newFlagSet builds a command's parser with a usage header.
+func newFlagSet(name, usageLine, summary string) *flag.FlagSet {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	fs.Usage = func() { usage(fs) }
-	fs.BoolVar(&f.server, "s", false, "run as server (wait for connections)")
-	fs.StringVar(&f.client, "c", "", "connect to HOST[:port] as client")
-	fs.IntVar(&f.port, "p", DefaultPort, "port (server listen / client connect)")
-	fs.StringVar(&f.bind, "bind", "", "server bind address (default all interfaces)")
-	fs.StringVar(&f.root, "root", ".", "server root directory (jail for all transfers)")
-	fs.StringVar(&f.dest, "dest", ".", "client destination directory (pull)")
-	fs.BoolVar(&f.pull, "pull", false, "pull from the server instead of pushing")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "usage: %s\n\n%s\n\n", usageLine, summary)
+		fs.PrintDefaults()
+	}
+	return fs
+}
+
+// addCommonFlags registers flags every command accepts.
+func addCommonFlags(fs *flag.FlagSet, f *flags) {
+	fs.BoolVar(&f.noTUI, "no-tui", false, "disable the TUI (single-line progress)")
+	fs.BoolVar(&f.quiet, "q", false, "quiet (errors only)")
+	fs.BoolVar(&f.verbose, "v", false, "verbose")
+	fs.StringVar(&f.logFile, "log-file", "", "append the transfer log to this file\n(default ~/.cache/botjim/transfers.log)")
+}
+
+// addTransferFlags registers the flags send/pull (and the legacy client) accept.
+func addTransferFlags(fs *flag.FlagSet, f *flags) {
+	fs.IntVar(&f.port, "p", DefaultPort, "port to connect to")
+	fs.StringVar(&f.dest, "dest", ".", "destination directory (pull)")
 	fs.StringVar(&f.compressA, "compress", "zstd", "compression: zstd | lz4 | none")
 	fs.IntVar(&f.zstdLvl, "zstd-level", 3, "zstd level 1(fastest)..4(best)")
 	fs.IntVar(&f.parallel, "parallel", 8, "parallel data streams (1..32)")
@@ -85,72 +95,112 @@ func parse(args []string) (*flags, error) {
 	fs.StringVar(&f.resume, "resume", "on", "resume mode: on | size | fresh")
 	fs.BoolVar(&f.noFsync, "no-fsync", false, "skip fsync before finalize")
 	fs.BoolVar(&f.stopErr, "stop-on-error", false, "abort the transfer on the first file error")
-	fs.BoolVar(&f.noTUI, "no-tui", false, "disable TUI (single-line progress)")
-	fs.BoolVar(&f.quiet, "q", false, "quiet (errors only)")
-	fs.BoolVar(&f.verbose, "v", false, "verbose")
 	fs.BoolVar(&f.probe, "probe", false, "probe the server (RTT/version) and exit")
-	fs.StringVar(&f.logFile, "log-file", "", "append diagnostics to this file")
-	if err := fs.Parse(args); err != nil {
-		return nil, err
-	}
-	f.rest = fs.Args()
-	return f, nil
-}
-
-func usage(fs *flag.FlagSet) {
-	fmt.Fprintf(os.Stderr, `botjim %s — files, ferried intact
-
-usage:
-  botjim -s [flags]                            server (waits; live dashboard)
-  botjim -c HOST[:port] [PATH...]              push PATHs to the server
-  botjim -c HOST[:port] --pull [RPATH...]      pull RPATHs from the server
-  botjim -c HOST[:port]                        browse & pick (TUI)
-  botjim update [--check] [--force]            self-update from GitHub
-  botjim version
-
-`, version.Version)
-	fs.PrintDefaults()
 }
 
 // Main runs one invocation and returns the process exit code.
 func Main(args []string) int {
-	if len(args) > 0 {
-		switch args[0] {
-		case "version", "--version", "-v":
-			if args[0] == "version" && len(args) > 1 {
-				fmt.Fprintln(os.Stderr, "usage: botjim version")
-				return 3
-			}
-			fmt.Printf("botjim %s (%s/%s)\nhttps://github.com/%s\n", version.Version, osName(), archName(), version.Repo)
-			return 0
-		case "help", "--help", "-h":
-			f, _ := parse(nil)
-			_ = f
-			fs := flag.NewFlagSet("botjim", flag.ContinueOnError)
-			fs.SetOutput(os.Stderr)
-			usage(fs)
-			return 0
-		case "update":
-			return updateCmd(args[1:])
+	if len(args) == 0 {
+		topLevelUsage()
+		return 3
+	}
+	switch args[0] {
+	case "server":
+		return cmdServer(args[1:])
+	case "relay":
+		return cmdRelay(args[1:])
+	case "recv":
+		return cmdRecv(args[1:])
+	case "send":
+		return cmdSend(args[1:], false)
+	case "pull":
+		return cmdSend(args[1:], true)
+	case "update":
+		return updateCmd(args[1:])
+	case "version", "--version", "-v":
+		if args[0] == "version" && len(args) > 1 {
+			fmt.Fprintln(os.Stderr, "usage: botjim version")
+			return 3
 		}
+		fmt.Printf("botjim %s (%s/%s)\nhttps://github.com/%s\n", version.Version, osName(), archName(), version.Repo)
+		return 0
+	case "help", "--help", "-h":
+		return helpCmd(args[1:])
+	case "-s": // legacy alias from v0.1.x
+		return cmdServer(args[1:])
+	case "-c": // legacy alias from v0.1.x
+		pull := false
+		var rest []string
+		for _, a := range args[1:] {
+			if a == "--pull" {
+				pull = true
+				continue
+			}
+			rest = append(rest, a)
+		}
+		return cmdSend(rest, pull)
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", args[0])
+		topLevelUsage()
+		return 3
 	}
+}
 
-	f, err := parse(args)
-	if err != nil {
-		return 3
-	}
-	if f.server == (f.client != "") {
-		fmt.Fprintln(os.Stderr, "error: exactly one of -s or -c HOST is required")
-		usage(flag.NewFlagSet("botjim", flag.ContinueOnError))
-		return 3
-	}
-	if f.parallel < 1 || f.parallel > 32 {
-		fmt.Fprintln(os.Stderr, "error: --parallel must be 1..32")
-		return 3
-	}
+func topLevelUsage() {
+	fmt.Fprint(os.Stderr, `botjim — files, ferried intact
 
+usage:
+  botjim server [flags]                        wait for transfers (dashboard)
+  botjim send HOST[:port] [PATH...]            push PATHs to the server
+  botjim pull HOST[:port] [RPATH...]           pull RPATHs from the server
+  botjim send HOST[:port]                      no paths: MC-style picker
+
+  botjim relay                                 run the pairing broker
+  botjim send --via RELAY PATH...              push through a relay (prints a code)
+  botjim recv --via RELAY --code CODE          receive a relay push
+
+  botjim update [--check] [--force]            self-update from GitHub
+  botjim version
+
+Each command takes --help for its full option list.
+(-s / -c from earlier releases still work as aliases.)
+
+`)
+}
+
+func helpCmd(args []string) int {
+	if len(args) == 0 {
+		topLevelUsage()
+		return 0
+	}
+	switch args[0] {
+	case "server":
+		cmdServer([]string{"--help"})
+	case "send":
+		cmdSend([]string{"--help"}, false)
+	case "relay":
+		cmdRelay([]string{"--help"})
+	case "recv":
+		cmdRecv([]string{"--help"})
+	case "pull":
+		cmdSend([]string{"--help"}, true)
+	case "update":
+		updateCmd([]string{"--help"})
+	default:
+		fmt.Fprintf(os.Stderr, "no help for %q\n", args[0])
+		topLevelUsage()
+		return 3
+	}
+	return 0
+}
+
+// parseHelp handles flag.ErrHelp: usage was already printed by the FlagSet.
+func parseHelp(err error) bool { return err == flag.ErrHelp }
+
+// signalContext sets up SIGINT/SIGTERM handling with the double-interrupt
+// hard exit shared by every long-running command.
+func signalContext() context.Context {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	go func() {
 		// second Ctrl-C exits immediately; sidecars are periodic so at most a
 		// couple of seconds of bitmap are lost, and re-hash repairs that.
@@ -161,15 +211,7 @@ func Main(args []string) int {
 		<-c2
 		os.Exit(2)
 	}()
-
-	if f.server {
-		if err := runServer(ctx, f); err != nil {
-			fmt.Fprintln(os.Stderr, "server error:", err)
-			return 2
-		}
-		return 0
-	}
-	return runClient(ctx, f)
+	return ctx
 }
 
 func hostPort(host string, port int) (string, error) {
@@ -185,11 +227,11 @@ func hostPort(host string, port int) (string, error) {
 func algID(name string) (uint8, error) {
 	switch name {
 	case "zstd":
-		return compress.AlgZstd, nil
+		return 1, nil
 	case "lz4":
-		return compress.AlgLz4, nil
+		return 2, nil
 	case "none":
-		return compress.AlgNone, nil
+		return 0, nil
 	}
 	return 0, fmt.Errorf("unknown compression %q (zstd|lz4|none)", name)
 }
@@ -216,195 +258,4 @@ func ownerPolicy(s string) (attrs.OwnerPolicy, error) {
 		return attrs.OwnerName, nil
 	}
 	return 0, fmt.Errorf("unknown owner policy %q (none|numeric|name)", s)
-}
-
-func preserveBits(f *flags) uint16 {
-	p := uint16(protocol.PreserveXattr | protocol.PreserveHardlink | protocol.PreserveSparse)
-	if f.noXattr {
-		p &^= protocol.PreserveXattr
-	}
-	if f.noSparse {
-		p &^= protocol.PreserveSparse
-	}
-	if f.devices {
-		p |= protocol.PreserveDevices
-	}
-	if f.owners != "none" {
-		p |= protocol.PreserveOwners
-	}
-	if f.owners == "name" {
-		p |= protocol.PreserveUname
-	}
-	return p
-}
-
-// runServer starts the listener and dashboard.
-func runServer(ctx context.Context, f *flags) error {
-	if err := os.MkdirAll(f.root, 0o755); err != nil {
-		return err
-	}
-	root, err := fsutil.ResolveRoot(f.root)
-	if err != nil {
-		return err
-	}
-	bind := f.bind
-	if bind == "" {
-		bind = fmt.Sprintf(":%d", f.port)
-	} else if !strings.Contains(bind, ":") {
-		bind = fmt.Sprintf("%s:%d", bind, f.port)
-	}
-	owners, err := ownerPolicy(f.owners)
-	if err != nil {
-		return err
-	}
-	ln, err := transport.Listen(bind)
-	if err != nil {
-		return err
-	}
-	srv := session.NewServer(session.ServerConfig{
-		Root:        root,
-		Parallel:    f.parallel,
-		Fsync:       !f.noFsync,
-		OwnerPolicy: owners,
-		AllowPush:   true,
-		AllowPull:   true,
-	})
-	fmt.Fprintf(os.Stderr, "botjim %s serving %s on %s (plain V1 — use on trusted networks)\n", version.Version, root, bind)
-
-	done := make(chan error, 1)
-	go func() { done <- srv.Serve(ln) }()
-
-	ui := newServerUI(srv, f)
-	ui.Run(ctx) // blocks: dashboard on TTY, ctx wait otherwise
-
-	srv.Stop()
-	time.Sleep(300 * time.Millisecond) // let sessions flush sidecars
-	select {
-	case err := <-done:
-		return err
-	default:
-		return nil
-	}
-}
-
-// runClient performs one push/pull (or opens the browser with no paths).
-func runClient(ctx context.Context, f *flags) int {
-	addr, err := hostPort(f.client, f.port)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 3
-	}
-	alg, err := algID(f.compressA)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 3
-	}
-	resume, err := resumeMode(f.resume)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 3
-	}
-	owners, err := ownerPolicy(f.owners)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 3
-	}
-
-	if f.probe {
-		return probeCmd(ctx, addr)
-	}
-
-	var paths []string
-	if !f.pull {
-		paths, err = fsutil.ExpandArgs(f.rest)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			return 3
-		}
-	} else {
-		paths = f.rest // server-relative, validated by the server
-	}
-
-	if len(paths) == 0 {
-		return runBrowser(ctx, f, addr, alg, resume, owners)
-	}
-
-	dir := uint8(protocol.DirPush)
-	if f.pull {
-		dir = protocol.DirPull
-	}
-	cfg, reg := buildClientConfig(f, addr, alg, resume, owners, paths)
-	logPath := openTransferLog(f, reg)
-	if logPath != "" {
-		defer closeTransferLog()
-	}
-	reg.Emit("info", "", fmt.Sprintf("transfer start (%s, %d paths)", directionName(f.pull), len(paths)))
-	rctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	ui := newClientUI(f, reg, dir == protocol.DirPull)
-	res := ui.Run(rctx, cancel, func() session.ClientResult {
-		return session.RunWithProgress(rctx, cfg, reg)
-	})
-	reg.Emit("info", "", fmt.Sprintf("transfer end: %d files, %d bytes, %d errors",
-		res.Report.Files, res.Report.Bytes, len(res.Report.Errors)))
-
-	rep := res.Report
-	fmt.Fprintf(os.Stderr, "\n%d files, %s transferred", rep.Files, humanBytes(rep.Bytes))
-	if rep.SkippedBytes > 0 {
-		fmt.Fprintf(os.Stderr, ", %s skipped (already present)", humanBytes(rep.SkippedBytes))
-	}
-	fmt.Fprintln(os.Stderr)
-	if logPath != "" {
-		fmt.Fprintf(os.Stderr, "transfer log: %s\n", logPath)
-	}
-	for _, fe := range rep.Errors {
-		fmt.Fprintf(os.Stderr, "  error: %s: %s\n", fe.Path, fe.Msg)
-	}
-	for _, w := range rep.Warnings {
-		if f.verbose {
-			fmt.Fprintf(os.Stderr, "  warn: %s\n", w)
-		}
-	}
-	if res.Err != nil {
-		fmt.Fprintln(os.Stderr, "transfer error:", res.Err)
-		if rep.Cancelled {
-			return 1
-		}
-		return 2
-	}
-	if len(rep.Errors) > 0 {
-		return 1
-	}
-	return 0
-}
-
-func probeCmd(ctx context.Context, addr string) int {
-	start := time.Now()
-	sess, err := transportDialProbe(ctx, addr)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "probe failed:", err)
-		return 2
-	}
-	defer sess.Close()
-	rtt, err := sess.RTT()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "probe: session ok, ping failed:", err)
-		return 0
-	}
-	fmt.Printf("%s reachable: handshake %.1fms, ping %.1fms, features %#x\n",
-		addr, float64(time.Since(start).Microseconds())/1000, float64(rtt.Microseconds())/1000, sess.HS.FeatureBits)
-	return 0
-}
-
-func humanBytes(n uint64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%dB", n)
-	}
-	div, exp := uint64(unit), 0
-	for m := n / unit; m >= unit; m /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f%c", float64(n)/float64(div), "KMGTPE"[exp])
 }
