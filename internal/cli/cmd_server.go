@@ -87,6 +87,7 @@ func runServer(ctx context.Context, f *flags, owners attrs.OwnerPolicy) error {
 		AllowPull:   true,
 		Token:       f.token,
 		Pass:        f.pass,
+		Cloak:       f.cloak,
 	})
 	fmt.Fprintf(os.Stderr, "botjim %s serving %s on %s (plain V1 — use on trusted networks)\n", version.Version, root, bind)
 

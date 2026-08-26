@@ -6,6 +6,7 @@
 package session
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -46,6 +47,7 @@ type ServerConfig struct {
 	Features    uint64
 	Token       string   // require --token auth from clients
 	Pass        string   // require record-layer encryption from clients
+	Cloak       string   // cloaked (WebSocket) mode: demux by first bytes
 	Exclude     []string // walker exclusions
 	Include     []string // walker inclusions
 	LimitBPS    int64    // send-rate cap (0 = unlimited)
@@ -143,6 +145,18 @@ func (s *Server) ServeConn(raw net.Conn) { s.handleConn(raw) }
 
 func (s *Server) handleConn(raw net.Conn) {
 	remote := raw.RemoteAddr().String()
+	// cloak demux: HTTP-looking connections upgrade inside ServeCloak;
+	// plain FSY1 bytes go straight through
+	if s.cfg.Cloak != "" && transport.CloakServe != nil {
+		br := bufio.NewReader(raw)
+		if transport.CloakSniff(br) {
+			wrapped := transport.CloakServe(raw, br, s.cfg.Cloak)
+			if wrapped == nil {
+				return // decoy answered; not our session
+			}
+			raw = wrapped
+		}
+	}
 	sess, err := transport.AcceptSec(raw, s.cfg.Features, nil, transport.SecOpts{Token: s.cfg.Token, Pass: s.cfg.Pass})
 	if err != nil {
 		s.Log("%s handshake: %v", remote, err)
@@ -375,6 +389,7 @@ type ClientConfig struct {
 	Conn        net.Conn // pre-paired connection (relay); Addr is display-only then
 	Token       string
 	Pass        string
+	Cloak       string
 	Exclude     []string
 	Include     []string
 	LimitBPS    int64
@@ -456,7 +471,7 @@ func retryableErr(err error) bool {
 func RunWithProgress(ctx context.Context, cfg ClientConfig, reg *progress.Registry) ClientResult {
 	var sess *transport.Session
 	var err error
-	sec := transport.SecOpts{Token: cfg.Token, Pass: cfg.Pass}
+	sec := transport.SecOpts{Token: cfg.Token, Pass: cfg.Pass, Cloak: cfg.Cloak}
 	if cfg.Conn != nil {
 		sess, err = transport.DialConnSec(cfg.Conn, protocol.FeatAll, nil, sec)
 	} else {

@@ -1177,6 +1177,11 @@ func (r *Receiver) maybePostPass(final bool) {
 		r.okEntry(e, "")
 	}
 
+	// mirror: delete jail entries the manifest does not carry (only after
+	// a clean manifest end; never on a cancelled/postless unwind)
+	if r.opts.Preserve&protocol.PreserveDelete != 0 && r.manifestDone && !r.aborted {
+		r.deleteExtraLocked()
+	}
 	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i].RelPath) > len(dirs[j].RelPath) })
 	for i := len(dirs) - 1; i >= 0; i-- {
 		e := dirs[i]
@@ -1442,6 +1447,46 @@ func (r *Receiver) removeParts(abs string) {
 	}
 	if part != "" {
 		r.forgetParts(abs)
+	}
+}
+
+// deleteExtraLocked mirrors the destination: entries in the jail that the
+// manifest never mentioned are removed (deepest-first so directories
+// empty out). caseSeen holds every manifest rel path, lower-cased — the
+// original-case map is rebuilt here for exact comparison.
+func (r *Receiver) deleteExtraLocked() {
+	keep := map[string]bool{}
+	r.mu.Lock()
+	for _, orig := range r.caseSeen {
+		keep[orig] = true
+	}
+	r.mu.Unlock()
+	var doomed []string
+	filepath.WalkDir(r.root, func(p string, d os.DirEntry, err error) error {
+		if err != nil || p == r.root {
+			return nil
+		}
+		rel, rerr := filepath.Rel(r.root, p)
+		if rerr != nil {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+		if keep[rel] {
+			return nil
+		}
+		doomed = append(doomed, p)
+		return nil
+	})
+	// deepest first: children before their parents
+	sort.Sort(sort.Reverse(sort.StringSlice(doomed)))
+	for _, p := range doomed {
+		if err := os.RemoveAll(p); err != nil {
+			r.warn(fmt.Sprintf("delete %s: %v", p, err))
+		} else {
+			rel, _ := filepath.Rel(r.root, p)
+			r.reg.Emit("info", filepath.ToSlash(rel), "deleted (not in source)")
+			r.report.Warnings = append(r.report.Warnings, "deleted: "+rel)
+		}
 	}
 }
 

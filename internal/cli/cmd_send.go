@@ -86,6 +86,9 @@ func cmdSend(args []string, pull bool) int {
 	}
 
 	applyConfigFromDefaults(f, args)
+	if f.jsonOut {
+		jsonEvents = true
+	}
 	ctx := signalContext()
 	return runClient(ctx, f)
 }

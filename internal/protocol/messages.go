@@ -29,6 +29,7 @@ const (
 	PreserveUname    uint16 = 1 << 4
 	PreserveOwners   uint16 = 1 << 5
 	PreserveDryRun   uint16 = 1 << 6 // plan only: receiver reports haves, sends nothing
+	PreserveDelete   uint16 = 1 << 7 // mirror: delete dest entries missing from the manifest
 )
 
 // InitTransfer opens a transfer on a session. Paths carries the pull-side

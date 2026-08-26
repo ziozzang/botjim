@@ -6,6 +6,7 @@
 package transport
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -72,13 +73,26 @@ type Session struct {
 	HS *protocol.Handshake // peer's handshake (post-intersection features)
 }
 
-// SecOpts carries the optional security layers applied right after the
-// handshake: a shared-secret token (mutual proof-of-knowledge) and a
-// passphrase record layer. Zero values disable both.
+// SecOpts carries the optional layers applied around the session: a
+// shared-secret token (mutual proof-of-knowledge), a passphrase record
+// layer, and cloak — carrying the whole session inside a WebSocket
+// upgrade so the traffic looks like HTTP. Zero values disable all.
 type SecOpts struct {
 	Token string
 	Pass  string
+	Cloak string // cloak path ("" = plain)
 }
+
+// CloakServe and CloakSniff are installed by the cloak package for the
+// server side: sniff HTTP-looking first bytes and upgrade matching ones.
+var (
+	CloakSniff func(br *bufio.Reader) bool
+	CloakServe func(conn net.Conn, br *bufio.Reader, path string) net.Conn
+)
+
+// CloakDialer is installed by the cloak package (transport stays
+// dependency-free): upgrade a raw conn to a cloaked conn.
+var CloakDialer func(conn net.Conn, path, host string) (net.Conn, error)
 
 func (o SecOpts) flags() uint8 {
 	var f uint8
@@ -105,6 +119,22 @@ func DialSec(ctx context.Context, addr string, features uint64, cipher CipherFun
 	raw, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
+	}
+	if sec.Cloak != "" {
+		if CloakDialer == nil {
+			_ = raw.Close()
+			return nil, errors.New("cloak: unavailable in this build")
+		}
+		host, _, serr := net.SplitHostPort(addr)
+		if serr != nil {
+			host = addr
+		}
+		wrapped, cerr := CloakDialer(raw, sec.Cloak, host)
+		if cerr != nil {
+			_ = raw.Close()
+			return nil, cerr
+		}
+		raw = wrapped
 	}
 	return DialConnSec(raw, features, cipher, sec)
 }

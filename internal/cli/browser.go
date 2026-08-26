@@ -52,6 +52,7 @@ func buildClientConfig(f *flags, addr string, alg uint8, resume uint8, owners at
 		OwnerPolicy: owners,
 		Token:       f.token,
 		Pass:        f.pass,
+		Cloak:       f.cloak,
 		Exclude:     f.exclude,
 		Include:     f.include,
 		LimitBPS:    f.limitB,
@@ -124,6 +125,9 @@ func directionName(pull bool) string {
 // openTransferLog wires the registry's persistent event sink; the path is
 // reported back for the final summary. --log-file overrides the default
 // location under the user cache dir.
+// jsonEvents selects NDJSON event output for the current command.
+var jsonEvents bool
+
 func openTransferLog(f *flags, reg *progress.Registry) string {
 	path := f.logFile
 	if path == "" {
@@ -144,6 +148,9 @@ func openTransferLog(f *flags, reg *progress.Registry) string {
 	transferLogFile = w
 	transferLogMu.Unlock()
 	reg.SetLogWriter(lockingWriter{w})
+	if jsonEvents {
+		attachJSON(reg)
+	}
 	// hash-chained audit journal (same events, tamper-evident)
 	if f.audit {
 		ap := f.auditFile

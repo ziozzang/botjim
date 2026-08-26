@@ -67,6 +67,9 @@ type flags struct {
 	retries   int    // auto-reconnect attempts
 	audit     bool
 	auditFile string
+	cloak     string
+	jsonOut   bool
+	deleteDst bool
 	exclude   []string // walker exclusions
 	include   []string // walker inclusions (when set, only these)
 	dryRun    bool
@@ -102,6 +105,9 @@ func addCommonFlags(fs *flag.FlagSet, f *flags) {
 	fs.BoolVar(&f.verbose, "v", false, "verbose")
 	fs.StringVar(&f.logFile, "log-file", "", "append the transfer log to this file\n(default ~/.cache/botjim/transfers.log)")
 	fs.BoolVar(&f.audit, "audit", false, "record a tamper-evident hash-chained audit journal")
+	fs.BoolVar(&f.jsonOut, "json", false, "emit NDJSON transfer events on stdout (for scripts/CI)")
+	fs.BoolVar(&f.deleteDst, "delete", false, "mirror: delete destination files missing from the manifest (jail-scoped)")
+	fs.StringVar(&f.cloak, "cloak", "", "disguise the session as HTTP/websocket traffic on this path\n(e.g. /cdn/data; both sides need the same path)")
 	fs.StringVar(&f.auditFile, "audit-file", "", "audit journal path (default ~/.cache/botjim/audit.log)")
 }
 
@@ -140,6 +146,12 @@ func Main(args []string) int {
 		return cmdAudit(args[1:])
 	case "config":
 		return cmdConfig(args[1:])
+	case "serve":
+		return cmdServe(args[1:])
+	case "completion":
+		return cmdCompletion(args[1:])
+	case "man":
+		return cmdMan(args[1:])
 	case "recv":
 		return cmdRecv(args[1:])
 	case "send":
@@ -189,6 +201,9 @@ usage:
   botjim swarm seed/join/track/verify         token-joined swarm distribution
   botjim audit verify|tail FILE               hash-chain journal reader
   botjim config path|show                     ~/.botjim/config.json defaults
+  botjim serve [DIR]                          HTTP+Range bridge for any downloader
+  botjim completion bash|zsh|fish             shell completions
+  botjim man                                  botjim(1) roff page
   botjim relay                                 run the pairing broker
   botjim send --via RELAY PATH...              push through a relay (prints a code)
   botjim recv --via RELAY --code CODE          receive a relay push
