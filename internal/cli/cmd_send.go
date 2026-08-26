@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/ziozzang/botjim/internal/attrs"
 	"github.com/ziozzang/botjim/internal/engine"
@@ -35,29 +36,53 @@ func cmdSend(args []string, pull bool) int {
 	addFilterFlags(fs, f)
 	addTransferFlags(fs, f)
 	addCommonFlags(fs, f)
-	if err := fs.Parse(args); err != nil {
-		if parseHelp(err) {
-			return 0
+	// stdlib flag stops at the first positional; users (and harnesses)
+	// write `send HOST --no-tui PATH`, so parse repeatedly, peeling one
+	// positional per pass and collecting them in order
+	var positionals []string
+	rest := args
+	for {
+		if err := fs.Parse(rest); err != nil {
+			if parseHelp(err) {
+				return 0
+			}
+			return 3
 		}
-		return 3
+		if fs.NArg() == 0 {
+			break
+		}
+		all := fs.Args()
+		positionals = append(positionals, all[0])
+		rest = all[1:]
+		sawFlag := false
+		for _, a := range rest {
+			if strings.HasPrefix(a, "-") && a != "-" {
+				sawFlag = true
+				break
+			}
+		}
+		if !sawFlag {
+			positionals = append(positionals, rest...)
+			break
+		}
 	}
 	if f.via != "" {
 		// relay mode: --via carries the address; every positional is a PATH
-		if fs.NArg() < 1 {
+		if len(positionals) < 1 {
 			fmt.Fprintln(os.Stderr, "error: --via needs explicit PATHs after the flags")
 			fs.Usage()
 			return 3
 		}
 		f.client = f.via // display only; the relay dialer parses it
-		f.rest = fs.Args()
+		f.rest = positionals
 	} else {
-		if fs.NArg() < 1 {
+		if len(positionals) < 1 {
 			fmt.Fprintf(os.Stderr, "error: %s needs HOST[:port] (or --via RELAY)\n", name)
 			fs.Usage()
 			return 3
 		}
-		f.client = fs.Arg(0)
-		f.rest = fs.Args()[1:]
+		f.client = positionals[0]
+		f.rest = positionals[1:]
 	}
 
 	ctx := signalContext()

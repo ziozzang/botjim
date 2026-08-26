@@ -130,6 +130,8 @@ func Main(args []string) int {
 		return cmdServer(args[1:])
 	case "relay":
 		return cmdRelay(args[1:])
+	case "swarm":
+		return cmdSwarm(args[1:])
 	case "recv":
 		return cmdRecv(args[1:])
 	case "send":
@@ -176,6 +178,7 @@ usage:
   botjim pull HOST[:port] [RPATH...]           pull RPATHs from the server
   botjim send HOST[:port]                      no paths: MC-style picker
 
+  botjim swarm seed/join/track/verify         token-joined swarm distribution
   botjim relay                                 run the pairing broker
   botjim send --via RELAY PATH...              push through a relay (prints a code)
   botjim recv --via RELAY --code CODE          receive a relay push
@@ -201,6 +204,8 @@ func helpCmd(args []string) int {
 		cmdSend([]string{"--help"}, false)
 	case "relay":
 		cmdRelay([]string{"--help"})
+	case "swarm":
+		cmdSwarm([]string{"--help"})
 	case "recv":
 		cmdRecv([]string{"--help"})
 	case "pull":
