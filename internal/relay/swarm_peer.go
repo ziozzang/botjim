@@ -30,6 +30,11 @@ type SwarmFile struct {
 	Size int64  `json:"size"`
 	Mode uint32 `json:"mode"`
 	SHA  string `json:"sha256"` // whole-file hash: end-to-end verification
+	// v2 chunk catalog: SHA-256 per grid chunk, in order. Lets joiners
+	// verify every chunk as it lands (instead of only at finalize),
+	// detect a lying peer immediately, and trust an existing part file
+	// chunk-by-chunk on resume. Empty for v1 specs.
+	Chunks []string `json:"chunks,omitempty"`
 }
 
 // SpecHash is the swarm ID.
@@ -37,6 +42,9 @@ func (s *SwarmSpec) SpecHash() string {
 	h := sha256.New()
 	for _, f := range s.Files {
 		fmt.Fprintf(h, "%s\x00%d\x00%s\x00", f.Path, f.Size, f.SHA)
+		for _, c := range f.Chunks {
+			fmt.Fprintf(h, "%s\x00", c)
+		}
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -81,21 +89,54 @@ func BuildSwarmSpec(ctx context.Context, roots []string, name string) (*SwarmSpe
 		}
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].rel < entries[j].rel })
-	spec := &SwarmSpec{Version: 1, Name: name}
+	spec := &SwarmSpec{Version: 2, Name: name}
 	for _, en := range entries {
 		fi, err := os.Lstat(en.abs)
 		if err != nil {
 			return nil, err
 		}
-		h, err := hashFile(en.abs)
+		h, chunks, err := hashFileChunks(en.abs, fi.Size())
 		if err != nil {
 			return nil, err
 		}
 		spec.Files = append(spec.Files, SwarmFile{
-			Path: en.rel, Size: fi.Size(), Mode: uint32(fi.Mode().Perm()), SHA: h,
+			Path: en.rel, Size: fi.Size(), Mode: uint32(fi.Mode().Perm()), SHA: h, Chunks: chunks,
 		})
 	}
 	return spec, nil
+}
+
+// hashFileChunks streams the file once, producing the whole-file SHA and
+// the per-chunk SHA-256 catalog on the deterministic grid.
+func hashFileChunks(p string, size int64) (string, []string, error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return "", nil, err
+	}
+	defer f.Close()
+	grid := chunking.NewGrid(size, chunking.ChunkSizeFor(size))
+	whole := sha256.New()
+	chunks := make([]string, 0, grid.Count())
+	buf := make([]byte, 256<<10)
+	for i := int64(0); i < grid.Count(); i++ {
+		ch := sha256.New()
+		remaining := grid.Len(i)
+		for remaining > 0 {
+			r := remaining
+			if int64(len(buf)) < r {
+				r = int64(len(buf))
+			}
+			got, err := io.ReadFull(f, buf[:r])
+			if err != nil {
+				return "", nil, err
+			}
+			whole.Write(buf[:got])
+			ch.Write(buf[:got])
+			remaining -= int64(got)
+		}
+		chunks = append(chunks, hex.EncodeToString(ch.Sum(nil)))
+	}
+	return hex.EncodeToString(whole.Sum(nil)), chunks, nil
 }
 
 func swarmRelBase(roots []string) (map[string]string, error) {

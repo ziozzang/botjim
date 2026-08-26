@@ -31,6 +31,7 @@ testing regime. The source of truth is the code; this is the map.
 | `internal/relay` | broker, pairing codes, e2ee handshake + record layer, spool, swarm (tracker/spec/joiner/spec signing) |
 | `internal/cloak` | WebSocket disguise: sniff, decoy page, upgrade, RFC 6455 framing |
 | `internal/audit` | hash-chained transfer journal (tamper-evident) |
+| `internal/metrics` | Prometheus text exposition for server counters |
 | `internal/discover` | LAN presence beacons (UDP multicast, opt-in) |
 | `internal/session` | connection lifecycle: who runs which engine; browser RPC; retry wrapper |
 | `internal/cli` / `internal/tui` | command surface, config/endpoints/sync policy, terminals |
@@ -168,9 +169,21 @@ tracker room is keyed by `SHA-256(token)` (the tracker never sees the
 token), and every peer↔peer link runs the e2ee record layer keyed from
 it — a peer without the token cannot even handshake. Joiners fetch
 chunks rarest-first from any peer (seed or joiner; joiners only serve
-files they have verified), verify per-file hashes, and resume on re-run.
+files they have verified) or from static HTTP hosting (`--http`, one
+Range request per chunk), and resume on re-run.
 Descriptors can be **ed25519-signed** (`swarm keygen`); joiners pin the
 signer with `--verify-key` so a swapped or tampered spec fails closed.
+
+**Chunk catalog v2.** Specs now carry a per-chunk SHA-256 catalog on the
+deterministic grid (same single pass as the whole-file hash). The joiner
+verifies every chunk as it lands — not only at finalize — which makes
+zero chunks verifiable, lets an existing part file be trusted
+chunk-by-chunk on resume, and turns a peer serving wrong bytes (an
+insider with the token) into an immediately detectable event: the chunk
+is refetched from another source and the liar is banned for the session.
+Fetches rotate the starting peer (round-robin) so load spreads across
+the mesh and every peer is exercised early. v1 specs still work; they
+verify at finalize only.
 
 ## Audit journal (v0.6+)
 
@@ -197,6 +210,26 @@ same tree always yields the same digest). `botjim pipe` is the
 `tar | nc` drop-in: stdin is spooled to a temp file and pushed through
 the full engine (`pipe send`), or one remote file is pulled and streamed
 to stdout (`pipe cat`) — the familiar pipes, but verified.
+
+## Mesh config propagation & watch (v0.9)
+
+`botjim config publish` wraps the endpoint list in an ed25519-signed,
+versioned envelope (`.botjim-mesh.json`). The envelope is an ordinary
+file: it rides a normal sync push, and the server's file-commit hook
+(`engine.Options.OnCommit`) applies it when the local config pins the
+mesh public key — signature must verify, version must be strictly
+greater, then endpoints merge (per name; node-local entries survive) and
+the config is written atomically. Failures (tamper, wrong key, stale)
+leave the config untouched. `sync push --watch` (fsnotify + debounce +
+periodic sweep with an mtime/size snapshot) turns this into continuous
+convergence: edit endpoints on one node, publish, and every watched peer
+absorbs the new list.
+
+## Metrics (v0.9)
+
+`server --metrics ADDR` exposes cumulative counters (sessions, files,
+bytes, errors), live gauges (active sessions, uptime, scrapes) and the
+build version in the Prometheus text format — stdlib only.
 
 ## LAN discovery (v0.8)
 

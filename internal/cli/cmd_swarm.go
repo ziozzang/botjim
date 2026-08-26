@@ -193,6 +193,7 @@ func swarmJoin(args []string) int {
 		par       int
 		serve     string
 		verifyKey string
+		httpBase  string
 	)
 	fs := newFlagSet("swarm join", "botjim swarm join [flags] --code CODE",
 		"Assemble the artifact into --dest: fetch missing chunks from any\npeer (seed or other joiners), verify each file, resume on re-run.")
@@ -203,6 +204,7 @@ func swarmJoin(args []string) int {
 	fs.IntVar(&par, "parallel", 4, "concurrent chunk fetches")
 	fs.StringVar(&serve, "serve", ":0", "also serve verified chunks to other joiners\n(the mesh ramp: peers on your LAN fetch from you; \"\" disables)")
 	fs.StringVar(&verifyKey, "verify-key", "", "require a valid ed25519 signature by this public key\n(hex, printed by 'swarm seed'/'swarm keygen') on the spec")
+	fs.StringVar(&httpBase, "http", "", "also fetch chunks from this static HTTP base URL\n(Range requests; e.g. https://host/dl/ — file paths are appended)\nchunk SHA-256 from the spec is the integrity check")
 	if err := fs.Parse(args); err != nil {
 		if parseHelp(err) {
 			return 0
@@ -241,6 +243,13 @@ func swarmJoin(args []string) int {
 		fmt.Fprintln(os.Stderr, "error: descriptor carries no files")
 		return 3
 	}
+	if httpBase != "" {
+		if len(full.Files[0].Chunks) == 0 {
+			fmt.Fprintln(os.Stderr, "warning: v1 spec has no chunk catalog — HTTP chunks verify only at finalize")
+		} else {
+			fmt.Fprintln(os.Stderr, "http source: chunks verified against the spec catalog as they land")
+		}
+	}
 
 	ctx := signalContext()
 	j := &relay.Joiner{
@@ -250,6 +259,7 @@ func swarmJoin(args []string) int {
 		Dest:        dest,
 		Parallel:    par,
 		ServeAddr:   serve,
+		HTTPBase:    httpBase,
 		OnProgress: func(done, total int64) {
 			fmt.Fprintf(os.Stderr, "\r%6.1f%% %s/%s",
 				float64(done)/float64(total)*100, humanBytes(uint64(done)), humanBytes(uint64(total)))

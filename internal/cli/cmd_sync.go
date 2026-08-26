@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"time"
 )
 
 // cmdSync implements `botjim sync push|pull` — one-shot mirror runs driven
@@ -53,10 +55,18 @@ func syncPolicy(name string) SyncTarget {
 }
 
 func syncPush(args []string) int {
-	var dir string
-	fs := newFlagSet("sync push", "botjim sync push [--dir DIR] NAME",
-		"One-shot mirror: push DIR to the endpoint NAME.\nApplies the target's include/exclude/delete policy.")
+	var (
+		dir      string
+		watch    bool
+		quietMs  int
+		sweepSec int
+	)
+	fs := newFlagSet("sync push", "botjim sync push [--dir DIR] [--watch] NAME",
+		"One-shot mirror: push DIR to the endpoint NAME.\nApplies the target's include/exclude/delete policy.\n--watch keeps it running: changes re-mirror after they settle.")
 	fs.StringVar(&dir, "dir", ".", "directory to mirror")
+	fs.BoolVar(&watch, "watch", false, "keep running: re-push whenever the source settles after changes\n(each re-push is a delta, so it is cheap)")
+	fs.IntVar(&quietMs, "debounce-ms", 500, "watch: quiet period before a re-push fires")
+	fs.IntVar(&sweepSec, "sweep-sec", 30, "watch: periodic full check for missed events")
 	fs.Parse(args)
 	if fs.NArg() < 1 {
 		fmt.Fprintln(os.Stderr, "error: sync push needs an endpoint NAME")
@@ -86,7 +96,34 @@ func syncPush(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: cannot enter %s: %v\n", dir, err)
 		return 2
 	}
-	return runClient(context.Background(), f.withRoot(dir))
+	if !watch {
+		return runClient(context.Background(), f.withRoot(dir))
+	}
+	// watch mode: stay in the original cwd only for the watcher's paths —
+	// we already chdir'd, and each push re-enters the same dir
+	abs, _ := filepath.Abs(dir)
+	if abs == "" {
+		abs = dir
+	}
+	fmt.Fprintf(os.Stderr, "watching %s → %s (debounce %dms)\n", abs, ep.Addr, quietMs)
+	push := func() error {
+		f2 := syncFlags(ep)
+		f2.include = f.include
+		f2.exclude = f.exclude
+		f2.deleteDst = f.deleteDst
+		f2.quiet = true
+		code := runClient(context.Background(), f2.withRoot(dir))
+		if code != 0 {
+			return fmt.Errorf("push exited %d", code)
+		}
+		return nil
+	}
+	ctx := signalContext()
+	if err := watchLoop(ctx, abs, time.Duration(quietMs)*time.Millisecond, time.Duration(sweepSec)*time.Second, push); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 2
+	}
+	return 0
 }
 
 func syncPull(args []string) int {

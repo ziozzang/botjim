@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ziozzang/botjim/internal/attrs"
@@ -50,7 +51,9 @@ type ServerConfig struct {
 	Cloak       string   // cloaked (WebSocket) mode: demux by first bytes
 	Exclude     []string // walker exclusions
 	Include     []string // walker inclusions
-	LimitBPS    int64    // send-rate cap (0 = unlimited)
+	LimitBPS    int64    // send-rate cap (0 = unlimited)	// OnCommit, when set, fires after each file lands verified (mesh
+	// config propagation uses it to accept .botjim-mesh.json).
+	OnCommit func(rel string)
 }
 
 // Server accepts connections and runs receiver/sender cores per session.
@@ -64,6 +67,35 @@ type Server struct {
 	lastErr error
 	ctx     context.Context
 	cancel  context.CancelFunc
+
+	// cumulative counters for /metrics (atomic; no lock on the hot path)
+	sessTotal  atomic.Int64
+	filesTotal atomic.Int64
+	bytesTotal atomic.Int64
+	errTotal   atomic.Int64
+}
+
+// ServerStats is a point-in-time snapshot for monitoring.
+type ServerStats struct {
+	Sessions int64
+	Files    int64
+	Bytes    int64
+	Errors   int64
+	Active   int
+}
+
+// Stats returns the cumulative + live counters.
+func (s *Server) Stats() ServerStats {
+	s.mu.Lock()
+	active := s.conns
+	s.mu.Unlock()
+	return ServerStats{
+		Sessions: s.sessTotal.Load(),
+		Files:    s.filesTotal.Load(),
+		Bytes:    s.bytesTotal.Load(),
+		Errors:   s.errTotal.Load(),
+		Active:   active,
+	}
 }
 
 // NewServer prepares a server for cfg.
@@ -166,6 +198,7 @@ func (s *Server) handleConn(raw net.Conn) {
 	s.mu.Lock()
 	s.conns++
 	s.mu.Unlock()
+	s.sessTotal.Add(1)
 	defer func() {
 		_ = sess.Close()
 		s.mu.Lock()
@@ -201,8 +234,11 @@ func (s *Server) handleConn(raw net.Conn) {
 			report, err := s.runTransfer(sess, ctrl, init, remote)
 			if err != nil {
 				s.Log("%s transfer: %v", remote, err)
+				s.errTotal.Add(1)
 			}
-			_ = report
+			s.filesTotal.Add(int64(report.Files))
+			s.bytesTotal.Add(int64(report.Bytes))
+			s.errTotal.Add(int64(len(report.Errors)))
 			// after one transfer the connection may send another or leave
 		case protocol.MsgListReq:
 			s.serveList(ctrl, frame.Payload)
@@ -287,6 +323,7 @@ func (s *Server) runTransfer(sess *transport.Session, ctrl *protocol.CtrlStream,
 		Exclude:     s.cfg.Exclude,
 		Include:     s.cfg.Include,
 		LimitBPS:    s.cfg.LimitBPS,
+		OnCommit:    s.cfg.OnCommit,
 	}
 	reg := progress.New()
 	s.mu.Lock()

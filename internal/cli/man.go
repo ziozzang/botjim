@@ -50,6 +50,8 @@ func cmdMan(args []string) int {
 			sb.WriteString("Print the config file location.\n")
 		case "config show":
 			sb.WriteString("Print the loaded config.\n")
+		case "config publish":
+			sb.WriteString("Sign the endpoints as a versioned mesh envelope for propagation.\n")
 		case "endpoints":
 			sb.WriteString("List named endpoints from the config.\n")
 		case "sync push":

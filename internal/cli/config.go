@@ -37,6 +37,16 @@ type Config struct {
 	Endpoints map[string]Endpoint `json:"endpoints"`
 	// per-target autosync policies (sync push/pull)
 	Autosync map[string]SyncTarget `json:"autosync"`
+	// mesh membership: pinned signer key + last applied envelope version
+	Mesh *MeshConfig `json:"mesh,omitempty"`
+}
+
+// MeshConfig is the local view of mesh-config propagation.
+type MeshConfig struct {
+	ID      string `json:"id,omitempty"`     // human label for the mesh
+	Key     string `json:"key"`              // pinned ed25519 public key (hex)
+	Version int64  `json:"version"`          // last applied envelope version
+	Origin  string `json:"origin,omitempty"` // which node produced it
 }
 
 // Endpoint is one named remote.
@@ -196,6 +206,7 @@ func cmdConfig(args []string) int {
 		fmt.Fprint(os.Stderr, `usage:
   botjim config path           print the config file location
   botjim config show           print the loaded config (JSON)
+  botjim config publish        sign the endpoints as a mesh envelope
 `)
 		return 3
 	}
@@ -203,6 +214,8 @@ func cmdConfig(args []string) int {
 	case "path":
 		fmt.Println(ConfigPath())
 		return 0
+	case "publish":
+		return cmdConfigPublish(args[1:])
 	case "show":
 		cfg, err := LoadConfig(ConfigPath())
 		if err != nil {

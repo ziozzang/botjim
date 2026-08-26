@@ -2,13 +2,18 @@ package relay
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ziozzang/botjim/internal/chunking"
@@ -35,10 +40,47 @@ type Joiner struct {
 	// LAN once). "" disables serving.
 	ServeAddr string
 
+	// HTTPBase, when set, lets the joiner fetch chunks over plain HTTP
+	// Range requests (HF-style static hosting) in addition to peers:
+	// URL = HTTPBase + file path. No auth on the wire — chunk SHA-256
+	// from the v2 catalog is the integrity check.
+	HTTPBase string
+
 	mu       sync.Mutex
+	rr       atomic.Int64        // round-robin cursor for peer rotation
 	parts    map[string]*os.File // rel path → part fd (lazy init)
 	verified map[string]bool     // rel path → passed whole-file SHA
+	banned   map[string]bool     // peer addr → served a bad chunk
 	serveLn  net.Listener
+}
+
+// banPeer removes a peer that served bytes failing the chunk hash from
+// all further fetches this session. One proven lie is enough: the record
+// layer already excludes wire corruption, so a mismatch means the peer
+// is wrong or malicious for this swarm.
+func (j *Joiner) banPeer(addr string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.banned == nil {
+		j.banned = map[string]bool{}
+	}
+	j.banned[addr] = true
+}
+
+func (j *Joiner) isBanned(addr string) bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.banned[addr]
+}
+
+// chunkOK verifies fetched bytes against the v2 chunk catalog (true when
+// the spec carries no catalog — v1 specs verify at finalize).
+func chunkOK(f SwarmFile, ci int64, data []byte) bool {
+	if ci >= int64(len(f.Chunks)) || len(f.Chunks) == 0 {
+		return true
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]) == f.Chunks[ci]
 }
 
 // Run drives one join to completion (all files verified) or ctx death.
@@ -102,7 +144,7 @@ func (j *Joiner) Run(ctx context.Context) error {
 				}
 				f := j.Spec.Files[t.file]
 				grid := chunking.Grid{Size: f.Size, ChunkSize: chunking.ChunkSizeFor(f.Size)}
-				data, err := j.fetchWithRetry(ctx, peers, t.file, t.chunk)
+				data, err := j.fetchWithRetry(ctx, peers, f, t.file, t.chunk)
 				if err != nil {
 					errOnce.Do(func() { fatal = fmt.Errorf("%s chunk %d: %w", f.Path, t.chunk, err) })
 					continue
@@ -142,22 +184,51 @@ func (j *Joiner) Run(ctx context.Context) error {
 	return nil
 }
 
-// fetchWithRetry tries every peer that announced the chunk (round-robin),
-// with a small backoff between rounds.
-func (j *Joiner) fetchWithRetry(ctx context.Context, peers []Peer, fileIdx, chunkIdx int64) ([]byte, error) {
+// fetchWithRetry tries every peer that announced the chunk (round-robin)
+// and, when configured, the HTTP source, with a small backoff between
+// rounds. Fetched bytes are verified against the chunk catalog before
+// they count; a peer that fails it is banned for the session.
+func (j *Joiner) fetchWithRetry(ctx context.Context, peers []Peer, f SwarmFile, fileIdx, chunkIdx int64) ([]byte, error) {
+	grid := chunking.Grid{Size: f.Size, ChunkSize: chunking.ChunkSizeFor(f.Size)}
+	var lastErr error
+	// rotate the starting peer per call: load spreads across the mesh
+	// instead of hammering whichever address sorts first, and every peer
+	// gets exercised (a lying peer is caught within a few chunks)
+	start := int(j.rr.Add(1))
 	for round := 0; round < 3; round++ {
-		for _, p := range peers {
+		for k := 0; k < len(peers); k++ {
+			p := peers[(start+k)%len(peers)]
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			data, err := PeerFetch(ctx, p.Addr, j.Spec.SpecHash(), j.Token, fileIdx, chunkIdx)
-			if err == nil {
-				return data, nil
-			}
-			if err == ErrChunkMiss {
+			if j.isBanned(p.Addr) {
 				continue
 			}
-			// dead peer: try the next
+			data, err := PeerFetch(ctx, p.Addr, j.Spec.SpecHash(), j.Token, fileIdx, chunkIdx)
+			if err != nil {
+				lastErr = err
+				if err == ErrChunkMiss {
+					continue
+				}
+				continue // dead peer: try the next
+			}
+			if !chunkOK(f, chunkIdx, data) {
+				j.banPeer(p.Addr)
+				lastErr = fmt.Errorf("peer %s served a chunk failing its hash", p.Addr)
+				continue
+			}
+			return data, nil
+		}
+		if j.HTTPBase != "" {
+			data, err := httpFetchChunk(ctx, j.HTTPBase, f, grid, chunkIdx)
+			if err == nil {
+				if chunkOK(f, chunkIdx, data) {
+					return data, nil
+				}
+				lastErr = fmt.Errorf("HTTP source served a chunk failing its hash")
+			} else {
+				lastErr = err
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -165,7 +236,41 @@ func (j *Joiner) fetchWithRetry(ctx context.Context, peers []Peer, fileIdx, chun
 		case <-time.After(time.Duration(round+1) * 500 * time.Millisecond):
 		}
 	}
-	return nil, fmt.Errorf("no peer served this chunk")
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no source served this chunk")
+	}
+	return nil, lastErr
+}
+
+// httpFetchChunk maps one chunk to an HTTP Range request against
+// HTTPBase + file path (any static host works: nginx, S3, HF resolve).
+func httpFetchChunk(ctx context.Context, base string, f SwarmFile, grid chunking.Grid, ci int64) ([]byte, error) {
+	url := strings.TrimSuffix(base, "/") + "/" + f.Path
+	off, n := grid.Offset(ci), grid.Len(ci)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, off+n-1))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("http %s for %s", resp.Status, url)
+	}
+	if resp.StatusCode == http.StatusOK && resp.ContentLength >= 0 && resp.ContentLength != n {
+		return nil, fmt.Errorf("http: full-body response of %d bytes (host ignores Range); expected chunk of %d", resp.ContentLength, n)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, n))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) != n {
+		return nil, fmt.Errorf("http: short read %d/%d", len(data), n)
+	}
+	return data, nil
 }
 
 // localChunks re-hashes existing part content for one file and returns
@@ -205,12 +310,18 @@ func (j *Joiner) localChunks(f SwarmFile, grid chunking.Grid) []bool {
 		if err != nil || int64(got) != n {
 			continue
 		}
-		if chunking.AllZero(buf[:n]) {
-			continue // unverifiable without reference bytes
+		if len(f.Chunks) == 0 {
+			// v1 spec: no catalog — non-zero bytes count provisionally,
+			// finalize re-verifies the whole file
+			if !chunking.AllZero(buf[:n]) {
+				have[i] = true
+			}
+			continue
 		}
-		// matches the spec only if the whole-file assembly would — cheap
-		// approximation: hash the chunk and compare to a later full verify
-		have[i] = true // provisional; finalize re-verifies the whole file
+		// v2: the catalog pins every chunk, zero chunks included
+		if chunkOK(f, i, buf[:n]) {
+			have[i] = true
+		}
 	}
 	return have
 }

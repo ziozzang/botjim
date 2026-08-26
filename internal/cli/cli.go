@@ -34,47 +34,48 @@ const DefaultPort = 4761
 // flags is one parsed invocation. Commands fill the subset they own; the
 // shared transfer fields are registered by addTransferFlags.
 type flags struct {
-	server    bool
-	client    string // host[:port] (send/pull target)
-	port      int
-	bind      string
-	root      string
-	dest      string
-	pull      bool
-	compressA string
-	zstdLvl   int
-	parallel  int
-	owners    string
-	noXattr   bool
-	noSparse  bool
-	devices   bool
-	oneFS     bool
-	resume    string
-	noFsync   bool
-	stopErr   bool
-	noTUI     bool
-	quiet     bool
-	verbose   bool
-	probe     bool
-	logFile   string
-	rest      []string
-	via       string // relay address for --via transfers
-	code      string // relay pairing code
-	token     string // shared-secret auth
-	pass      string // passphrase record-layer encryption
-	limit     string // bandwidth cap (e.g. 100M)
-	limitB    int64  // parsed
-	retries   int    // auto-reconnect attempts
-	audit     bool
-	auditFile string
-	cloak     string
-	receipt   string
-	jsonOut   bool
-	deleteDst bool
-	exclude   []string // walker exclusions
-	include   []string // walker inclusions (when set, only these)
-	dryRun    bool
-	discover  bool // server: announce on the LAN multicast group
+	server      bool
+	client      string // host[:port] (send/pull target)
+	port        int
+	bind        string
+	root        string
+	dest        string
+	pull        bool
+	compressA   string
+	zstdLvl     int
+	parallel    int
+	owners      string
+	noXattr     bool
+	noSparse    bool
+	devices     bool
+	oneFS       bool
+	resume      string
+	noFsync     bool
+	stopErr     bool
+	noTUI       bool
+	quiet       bool
+	verbose     bool
+	probe       bool
+	logFile     string
+	rest        []string
+	via         string // relay address for --via transfers
+	code        string // relay pairing code
+	token       string // shared-secret auth
+	pass        string // passphrase record-layer encryption
+	limit       string // bandwidth cap (e.g. 100M)
+	limitB      int64  // parsed
+	retries     int    // auto-reconnect attempts
+	audit       bool
+	auditFile   string
+	cloak       string
+	receipt     string
+	jsonOut     bool
+	deleteDst   bool
+	exclude     []string // walker exclusions
+	include     []string // walker inclusions (when set, only these)
+	dryRun      bool
+	discover    bool   // server: announce on the LAN multicast group
+	metricsAddr string // server: Prometheus /metrics listen address ("" = off)
 }
 
 // stringList is a repeatable string flag (--exclude a --exclude b).

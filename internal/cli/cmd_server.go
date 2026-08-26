@@ -11,6 +11,7 @@ import (
 	"github.com/ziozzang/botjim/internal/attrs"
 	"github.com/ziozzang/botjim/internal/discover"
 	"github.com/ziozzang/botjim/internal/fsutil"
+	"github.com/ziozzang/botjim/internal/metrics"
 	"github.com/ziozzang/botjim/internal/session"
 	"github.com/ziozzang/botjim/internal/transport"
 	"github.com/ziozzang/botjim/internal/version"
@@ -32,6 +33,7 @@ func cmdServer(args []string) int {
 	fs.StringVar(&f.token, "token", "", "require this shared-secret token from clients")
 	fs.StringVar(&f.pass, "pass", "", "require record-layer encryption with this passphrase\n(clients must use the same --pass)")
 	fs.BoolVar(&f.discover, "discover", false, "announce this server on the LAN multicast group\n('botjim peers' lists it; opt-in — reveals name/addr/root/version)")
+	fs.StringVar(&f.metricsAddr, "metrics", "", "serve Prometheus metrics on this address (e.g. :9090; off by default)")
 	addCommonFlags(fs, f)
 	if err := fs.Parse(args); err != nil {
 		if parseHelp(err) {
@@ -83,6 +85,7 @@ func runServer(ctx context.Context, f *flags, owners attrs.OwnerPolicy) error {
 	}
 	srv := session.NewServer(session.ServerConfig{
 		Root:        root,
+		OnCommit:    meshOnCommit(root),
 		Parallel:    f.parallel,
 		Fsync:       !f.noFsync,
 		OwnerPolicy: owners,
@@ -93,6 +96,15 @@ func runServer(ctx context.Context, f *flags, owners attrs.OwnerPolicy) error {
 		Cloak:       f.cloak,
 	})
 	fmt.Fprintf(os.Stderr, "botjim %s serving %s on %s (plain V1 — use on trusted networks)\n", version.Version, root, bind)
+	if f.metricsAddr != "" {
+		started := time.Now()
+		go func() {
+			if err := metrics.Serve(ctx.Done(), f.metricsAddr, srv, started); err != nil {
+				fmt.Fprintf(os.Stderr, "metrics: %v\n", err)
+			}
+		}()
+		fmt.Fprintf(os.Stderr, "metrics on http://%s/metrics\n", f.metricsAddr)
+	}
 	if f.discover {
 		advPort := f.port
 		if ta, ok := ln.Addr().(*net.TCPAddr); ok && ta.Port > 0 {

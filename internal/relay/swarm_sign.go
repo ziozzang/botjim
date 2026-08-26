@@ -70,6 +70,24 @@ func (m *SwarmManifest) Verify(expectedPub string) error {
 // Signed reports whether the descriptor carries a signature.
 func (m *SwarmManifest) Signed() bool { return m.PubKey != "" && m.Sig != "" }
 
+// DefaultMeshKeyPath is the conventional mesh-config signing key.
+func DefaultMeshKeyPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ".botjim-mesh.key"
+	}
+	return filepath.Join(home, ".botjim", "keys", "mesh-ed25519")
+}
+
+// LoadOrCreateEd25519Key returns the key at path, generating it when
+// missing (0600, parents created).
+func LoadOrCreateEd25519Key(path string) (ed25519.PrivateKey, error) {
+	if _, err := os.Stat(path); err == nil {
+		return LoadSwarmKey(path)
+	}
+	return GenerateSwarmKey(path)
+}
+
 // DefaultSwarmKeyPath is the conventional signer key location.
 func DefaultSwarmKeyPath() string {
 	home, err := os.UserHomeDir()

@@ -29,15 +29,16 @@ $ botjim recv --via relay.example.com --code 코드      # 반대편에서 수�
 - **압축** — 청크 단위 zstd(기본)/lz4/none. 비압축성 데이터는 자동 raw 폴백.
 - **다이렉트 모드 인증·암호화** — `--token`(HMAC 증명, 상수시간 비교), `--pass`(X25519 + ChaCha20-Poly1305 레코드 레이어 — 핸드셰이크까지 전부 암호문), `--cloak PATH`(전체 세션이 WebSocket 업그레이드를 타고 HTTP처럼 보임; 일반 GET엔 디코이 페이지). 셋 다 없으면 다이렉트 모드는 평문 — 신뢰하는 네트워크에서만.
 - **릴레이 모드** — NAT 뒤의 머신끼리: 양쪽 모두 브로커로 아웃바운드 접속, 125비트 코드로 페어링, 종단간 암호화 — **브로커는 암호문만 다룹니다**. `--spool-max`(기본 2GiB, 메모리 우선→디스크 스플)까지 버퍼링.
-- **스웜 모드** — 토큰 조인 청크 분배(LLM 모델, 데이터셋 등 불변 아티팩트): `swarm seed`가 트리를 해시해 스펙(`.swarm.json`, 파일별 SHA-256, ed25519 서명 선택)으로 만들고 청크 서빙+트래커 announce; `swarm join`은 모든 피어(시드든 검증 완료 조이너든)에게서 조립 — rarest-first, 이어받기 가능. 토큰이 트래커 룸과 피어 링크 암호 키를 겸합니다.
+- **스웜 모드** — 토큰 조인 청크 분배(LLM 모델, 데이터셋 등 불변 아티팩트): `swarm seed`가 트리를 해시해 스펙(`.swarm.json`, 파일별 SHA-256 + v2 청크별 SHA 카탈로그, ed25519 서명 선택)으로 만들고 청크 서빙+트래커 announce; `swarm join`은 모든 소스(시드, 검증 완료 조이너, `--http` 정적 호스팅 Range)에서 조립 — rarest-first, 이어받기 가능. 청크는 도착 즉시 카탈로그로 검증되며, 해시가 틀린 바이트를 준 피어는 그 세션에서 차단됩니다. 토큰이 트래커 룸과 피어 링크 암호 키를 겸합니다.
 - **필터·속도 제한** — `--exclude`/`--include` 글롭(홀로 쓴 이름은 모든 컴포넌트에 매치, `**` 재귀), `--limit 100M` 대역폭 상한, `--dry-run` 전송 없이 계획만, `--delete` 미러 모드(매니페스트에 없는 목적측 항목 제거, 감옥 범위 내).
-- **네임드 엔드포인트·싱크** — `~/.botjim/config.json`에 엔드포인트(`{"lab1": {"addr": "10.0.0.5:4761", "token": "…"}}`)와 타깃별 autosync 정책(include/exclude/delete/dest) 저장; `botjim sync push lab1` / `sync pull lab1`이 그 정책으로 미러링. `send lab1`처럼 이름만 써도 해석됩니다.
+- **네임드 엔드포인트·싱크** — `~/.botjim/config.json`에 엔드포인트(`{"lab1": {"addr": "10.0.0.5:4761", "token": "…"}}`)와 타깃별 autosync 정책(include/exclude/delete/dest) 저장; `botjim sync push lab1` / `sync pull lab1`이 그 정책으로 미러링. `send lab1`처럼 이름만 써도 해석됩니다. `sync push --watch`는 소스가 바뀌면(디바운스 후) 계속 미러링 — 재전송은 델타라 저렴합니다.
+- **메시 config 전파** — 한 노드에서 엔드포인트 목록을 고치면 전 노드가 수렴: `botjim config publish`가 목록을 ed25519 서명 + 버전 매긴 봉투(`.botjim-mesh.json`)로 싸고, 메시 키를 고정(pin)한 수신 서버가 서명과 단조 증가 버전을 검증한 뒤 자기 config에 자동 병합합니다. 새 프로토콜 없이 일반 sync push로 전달됩니다.
 - **파이프 모드** — `tar c x | botjim pipe send --stdin x.tgz HOST`, `botjim pipe cat HOST PATH > file`: 익숙한 파이프인데 엔진 기반(스풀→검증→리줌).
 - **감사·영수증** — `--audit`은 모든 전송을 변조 방지 해시체인 저널에 기록(`botjim audit verify|tail`); `--receipt`는 매니페스트 다이제스트가 담긴 JSON 영수증을 남깁니다.
 - **TUI** — 서버는 btop 스타일 실시간 대시보드(브라유 스파크라인, 연결별·파일별 속도/남은시간). 클라이언트는 진행률 바·실시간 속도·전체/파일별 남은 시간·스크롤 전송 로그. 모든 화면에서 `?` 도움말. 파이프에서는 한 줄 폴백.
 - **MC 브라우저** — 경로 없이 실행하면 미드나잇 커맨더 스타일 픽커. space로 파일·**폴더**(하위 전체) 모두 선택, `/` 정규식 필터(매치 하이라이트), PgUp/PgDn 스크롤. pull은 서버 디렉터리를 원격 탐색.
 - **LAN 발견** — `botjim server --discover`가 멀티캐스트로 비컨(옵트인); `botjim peers`로 네트워크의 서버를 이름/주소/버전/루트와 함께 표시.
-- **HTTP 브리지** — `botjim serve [DIR]`: Range 지원 일반 HTTP — 브라우저/curl/HF 스타일 다운로더가 로컬 트리를 그대로 소비.
+- **HTTP 브리지·메트릭** — `botjim serve [DIR]`: Range 지원 일반 HTTP — 브라우저/curl/HF 스타일 다운로더가 로컬 트리를 그대로 소비. `botjim server --metrics :9090`은 Prometheus 카운터(세션·파일·바이트·에러·활성)를 노출합니다.
 - **자동 업데이트** — `botjim update` 가 GitHub Releases에서 SHA256SUMS 검증 후 자기 교체.
 
 ## 설치
@@ -57,7 +58,8 @@ go build -o botjim ./cmd/botjim
 | `botjim server [플래그]` | 대기 (기본 포트 4761); `--root`가 감옥; `--discover`로 LAN 비컨 |
 | `botjim send HOST\|NAME [PATH...]` | push; 경로 없으면 픽커; NAME은 config 엔드포인트 해석 |
 | `botjim pull HOST\|NAME [RPATH...]` | `--dest`로 pull |
-| `botjim sync push\|pull NAME` | 타깃 autosync 정책으로 원샷 미러 |
+| `botjim sync push\|pull NAME` | 타깃 autosync 정책으로 원샷 미러; `push --watch`로 상시 미러링 |
+| `botjim config publish` | 엔드포인트를 메시 봉투로 서명(자동 전파용) |
 | `botjim pipe send --stdin NAME HOST` | stdin → 원격 파일 (`tar \| nc` 대체) |
 | `botjim pipe cat HOST PATH` | 원격 파일 → stdout |
 | `botjim peers` | LAN의 `--discover` 서버 탐색 |

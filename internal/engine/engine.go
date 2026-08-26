@@ -22,12 +22,13 @@ type Options struct {
 	KeepGoing   bool
 	Fsync       bool
 	OwnerPolicy attrs.OwnerPolicy
-	Nonce       string   // session nonce hex — suffix for new part files
-	RelHome     string   // sender side: root that maps to manifest "."
-	Exclude     []string // walker exclusions
-	Include     []string // walker inclusions
-	LimitBPS    int64    // send-rate cap (0 = unlimited)
-	DryRun      bool     // plan only
+	Nonce       string           // session nonce hex — suffix for new part files
+	RelHome     string           // sender side: root that maps to manifest "."
+	Exclude     []string         // walker exclusions
+	Include     []string         // walker inclusions
+	LimitBPS    int64            // send-rate cap (0 = unlimited)
+	DryRun      bool             // plan only
+	OnCommit    func(rel string) // receiver: a file finished and verified (nil = no hook)
 }
 
 // FileError is one failed file in the report.

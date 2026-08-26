@@ -27,15 +27,16 @@ $ botjim recv --via relay.example.com --code CODE     # receive on the other mac
 - **Compression** — per-chunk zstd (default) / lz4 / none, with automatic raw fallback for incompressible data.
 - **Auth & encryption (direct mode)** — `--token` (HMAC proof, constant-time compare), `--pass` (X25519 + ChaCha20-Poly1305 record layer — everything including the handshake is ciphertext), `--cloak PATH` (the whole session rides a WebSocket upgrade on an HTTP-looking path; plain GETs get a decoy page). Without any of these, direct mode is plaintext — use on trusted networks.
 - **Relay mode** — for machines behind NAT: both peers connect out to a broker, pair on a 125-bit code, and transfer end-to-end encrypted; the relay shuffles ciphertext only. The broker can buffer up to `--spool-max` (default 2GiB, memory-first then disk) so a fast sender can run ahead of a slow receiver.
-- **Swarm mode** — token-joined, chunk-level distribution for immutable artifacts (LLM weights, datasets): `swarm seed` hashes the tree into a spec (`.swarm.json`, per-file SHA-256, optionally ed25519-signed), serves chunks and announces to a tracker; `swarm join` assembles from *any* peer — seed or other joiners (verified data only is re-served) — rarest-first, resumable. The token derives the tracker room and keys every peer link.
+- **Swarm mode** — token-joined, chunk-level distribution for immutable artifacts (LLM weights, datasets): `swarm seed` hashes the tree into a spec (`.swarm.json`, per-file SHA-256 + a v2 per-chunk SHA catalog, optionally ed25519-signed), serves chunks and announces to a tracker; `swarm join` assembles from *any* peer — seed, other joiners (verified data only is re-served), or `--http` static hosting via Range requests — rarest-first, resumable. Every fetched chunk is verified against the catalog as it lands; a peer that serves bytes failing it is banned for the session. The token derives the tracker room and keys every peer link.
 - **Filters & pacing** — `--exclude`/`--include` globs (bare names match any component, `**` recurses), `--limit 100M` bandwidth cap, `--dry-run` plan without sending, `--delete` mirror mode (destination entries missing from the manifest are removed, jail-scoped).
-- **Named endpoints & sync** — `~/.botjim/config.json` stores endpoints (`{"lab1": {"addr": "10.0.0.5:4761", "token": "…"}}`) and per-target autosync policy (include/exclude/delete/dest); `botjim sync push lab1` / `sync pull lab1` mirror with that policy. Plain `send lab1` resolves the name too.
+- **Named endpoints & sync** — `~/.botjim/config.json` stores endpoints (`{"lab1": {"addr": "10.0.0.5:4761", "token": "…"}}`) and per-target autosync policy (include/exclude/delete/dest); `botjim sync push lab1` / `sync pull lab1` mirror with that policy. Plain `send lab1` resolves the name too. `sync push --watch` keeps mirroring as the source changes (debounced; each re-push is a delta).
+- **Mesh config propagation** — edit the endpoint list on one node, every node converges: `botjim config publish` wraps the endpoints in an ed25519-signed, versioned envelope (`.botjim-mesh.json`); a receiving server with the mesh key pinned validates the signature and a strictly increasing version, then merges it into its own config automatically. No new protocol — the envelope rides an ordinary sync push.
 - **Pipe mode** — `tar c x | botjim pipe send --stdin x.tgz HOST` and `botjim pipe cat HOST PATH > file`: the familiar pipes, but engine-backed (spooled, verified, resumable).
 - **Audit & receipts** — `--audit` appends every transfer to a tamper-evident hash-chained journal (`botjim audit verify|tail`); `--receipt` writes a JSON receipt with the manifest digest — proof of what moved.
 - **TUI** — btop-style server dashboard (braille sparkline throughput, per-connection and per-file rate/ETA, log tail); client progress view (bar, live rate, global and per-file ETA, scrolling transfer log); `?` help everywhere; single-line fallback in pipes.
 - **MC-style browser** — run `send` with no paths to pick files midnight-commander-style: space marks (files AND directories — a marked directory sends its subtree), `/` regex-filters with match highlighting, PgUp/PgDn scrolling, `?` help; pull mode browses the server remotely.
 - **LAN discovery** — `botjim server --discover` beacons on a multicast group (opt-in); `botjim peers` lists servers on the network with name/address/version/root.
-- **HTTP bridge** — `botjim serve [DIR]`: plain HTTP with Range support, so browsers/curl/HF-style downloaders can consume any local tree.
+- **HTTP bridge & metrics** — `botjim serve [DIR]`: plain HTTP with Range support, so browsers/curl/HF-style downloaders can consume any local tree; `botjim server --metrics :9090` exposes Prometheus counters (sessions, files, bytes, errors, active).
 - **Self-update** — `botjim update` replaces the binary from GitHub Releases after SHA256SUMS verification.
 
 ## Install
@@ -55,7 +56,8 @@ Every command takes `--help` for its full option list. (`-s` / `-c` from earlier
 | `botjim server [flags]` | wait for transfers (default port 4761); `--root` is the jail; `--discover` announces on the LAN |
 | `botjim send HOST\|NAME [PATH...]` | push; no paths opens the picker; names resolve via config endpoints |
 | `botjim pull HOST\|NAME [RPATH...]` | pull into `--dest` |
-| `botjim sync push\|pull NAME` | one-shot mirror with the target's autosync policy |
+| `botjim sync push\|pull NAME` | one-shot mirror with the target's autosync policy; `push --watch` keeps mirroring |
+| `botjim config publish` | sign endpoints as a mesh envelope for automatic propagation |
 | `botjim pipe send --stdin NAME HOST` | stdin → remote file (`tar \| nc` drop-in) |
 | `botjim pipe cat HOST PATH` | remote file → stdout |
 | `botjim peers` | discover `--discover` servers on the LAN |

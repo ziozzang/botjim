@@ -3,7 +3,7 @@
 package version
 
 // Version is the current botjim version.
-const Version = "0.8.0"
+const Version = "0.9.0"
 
 // Repo is the GitHub repository self-update pulls from.
 const Repo = "ziozzang/botjim"

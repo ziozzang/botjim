@@ -1041,6 +1041,9 @@ func (r *Receiver) finalize(id uint32) {
 	r.reg.FileStateUpdate(e.ID, "done", "")
 	r.okEntryLocked(f, e)
 	r.pruneStaleParts(f.abs)
+	if r.opts.OnCommit != nil {
+		r.opts.OnCommit(e.RelPath) // after everything: the file is final and verified
+	}
 }
 
 // pruneStaleParts removes leftover parts (and their sidecars) for an
