@@ -403,6 +403,55 @@ func RunTransfer(ctx context.Context, cfg ClientConfig) ClientResult {
 	return RunWithProgress(ctx, cfg, progress.New())
 }
 
+// RunWithRetries wraps RunWithProgress with automatic re-dial on
+// connection loss: resume sidecars make each attempt continue where the
+// last died, so a flaky link converges instead of failing the run.
+// Backoff: 1s, 2s, 4s … capped at 30s.Attempts is bounded by retries+1.
+func RunWithRetries(ctx context.Context, cfg ClientConfig, reg *progress.Registry, retries int) ClientResult {
+	var last ClientResult
+	for attempt := 0; attempt <= retries; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(1<<uint(attempt-1)) * time.Second
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+			reg.Emit("info", "", fmt.Sprintf("retry %d/%d after %s", attempt, retries, backoff))
+			select {
+			case <-ctx.Done():
+				return last
+			case <-time.After(backoff):
+			}
+		}
+		last = RunWithProgress(ctx, cfg, reg)
+		if last.Err == nil {
+			return last
+		}
+		// only connection-class errors are retryable; refusals are final
+		if !retryableErr(last.Err) {
+			return last
+		}
+	}
+	return last
+}
+
+// retryableErr reports whether the error looks like a transport failure
+// (worth another dial) rather than a peer refusal or protocol violation.
+func retryableErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, fatal := range []string{
+		"refused", "not allowed", "token", "--pass", "encryption",
+		"protocol", "major mismatch", "not a botjim peer",
+	} {
+		if strings.Contains(msg, fatal) {
+			return false
+		}
+	}
+	return true
+}
+
 // RunWithProgress is RunTransfer with a caller-owned progress registry.
 func RunWithProgress(ctx context.Context, cfg ClientConfig, reg *progress.Registry) ClientResult {
 	var sess *transport.Session

@@ -30,6 +30,7 @@ func cmdSend(args []string, pull bool) int {
 	fs.StringVar(&f.token, "token", "", "shared-secret token the server requires")
 	fs.StringVar(&f.pass, "pass", "", "encrypt the session with this passphrase\n(the server must use the same --pass)")
 	fs.StringVar(&f.limit, "limit", "", "cap the send rate (e.g. 100M, 500K; 0 = unlimited)")
+	fs.IntVar(&f.retries, "retries", 0, "auto-reconnect attempts on connection loss\n(each resumes where the last died; backoff 1s,2s,4s…30s)")
 	fs.BoolVar(&f.dryRun, "dry-run", false, "plan only: show what would transfer, send nothing")
 	addFilterFlags(fs, f)
 	addTransferFlags(fs, f)
@@ -177,7 +178,7 @@ func runClient(ctx context.Context, f *flags) int {
 		ui.waitKey = false // single-shot: a relay slot carries one transfer
 	}
 	res := ui.Run(rctx, cancel, func() session.ClientResult {
-		return session.RunWithProgress(rctx, cfg, reg)
+		return session.RunWithRetries(rctx, cfg, reg, f.retries)
 	})
 	reg.Emit("info", "", fmt.Sprintf("transfer end: %d files, %d bytes, %d errors",
 		res.Report.Files, res.Report.Bytes, len(res.Report.Errors)))

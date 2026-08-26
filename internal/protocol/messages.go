@@ -551,6 +551,32 @@ func DecodeCommit(p []byte) (Commit, error) {
 	return m, d.err
 }
 
+// ChunkRequest asks a source to send one chunk on the next data stream
+// frame — receiver-driven acquisition, the mesh/swarm primitive. The
+// sender role answers; the push scheduler never sends these.
+type ChunkRequest struct {
+	FileID   uint32
+	ChunkIdx uint64
+}
+
+// Encode serializes m.
+func (m ChunkRequest) Encode() []byte {
+	var e enc
+	e.uv(uint64(m.FileID))
+	e.uv(m.ChunkIdx)
+	return e.b
+}
+
+// DecodeChunkRequest parses a ChunkRequest payload.
+func DecodeChunkRequest(p []byte) (ChunkRequest, error) {
+	var d dec
+	d.b = p
+	var m ChunkRequest
+	m.FileID = uint32(d.uv())
+	m.ChunkIdx = d.uv()
+	return m, d.err
+}
+
 // Done summarizes a finished transfer (receiver → sender).
 type Done struct {
 	Files  uint64

@@ -64,6 +64,7 @@ type flags struct {
 	pass      string   // passphrase record-layer encryption
 	limit     string   // bandwidth cap (e.g. 100M)
 	limitB    int64    // parsed
+	retries   int      // auto-reconnect attempts
 	exclude   []string // walker exclusions
 	include   []string // walker inclusions (when set, only these)
 	dryRun    bool

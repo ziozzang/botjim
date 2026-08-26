@@ -46,6 +46,7 @@ type Sender struct {
 	hasHardlinks  bool
 
 	taskCh  chan chunkTask
+	reqCh   chan chunkTask // request-driven tasks (fanout/swarm source)
 	kick    chan struct{}
 	limiter *limiter
 	dryRun  bool
@@ -97,6 +98,7 @@ func NewSender(sess *transport.Session, ctrl *protocol.CtrlStream, opts Options,
 		emittedIDs:  map[uint32]bool{},
 		resolvedIDs: map[uint32]bool{},
 		taskCh:      make(chan chunkTask, opts.Parallel*2),
+		reqCh:       make(chan chunkTask, opts.Parallel*4),
 		kick:        make(chan struct{}, 1),
 		ctrlDone:    make(chan struct{}),
 	}
@@ -381,6 +383,27 @@ func (s *Sender) readCtrl(ctx context.Context, cancel context.CancelFunc) {
 				return
 			}
 			s.retryChunk(m)
+		case protocol.MsgChunkRequest:
+			// request-driven acquisition (fanout/swarm): serve exactly the
+			// chunks asked for; the scheduler stays off for these files
+			m, err := protocol.DecodeChunkRequest(payload)
+			if err != nil {
+				s.setFatal(err)
+				cancel()
+				return
+			}
+			select {
+			case s.reqCh <- chunkTask{fileID: m.FileID, idx: int64(m.ChunkIdx)}:
+			case <-ctx.Done():
+				return
+			default:
+				go func() {
+					select {
+					case s.reqCh <- chunkTask{fileID: m.FileID, idx: int64(m.ChunkIdx)}:
+					case <-ctx.Done():
+					}
+				}()
+			}
 		case protocol.MsgError:
 			m, err := protocol.DecodeErrMsg(payload)
 			if err == nil && m.Scope == protocol.ScopeSession {
@@ -768,8 +791,23 @@ func (s *Sender) runWorker(ctx context.Context, index uint64) error {
 		case <-ctx.Done():
 			_ = conn.Close()
 			return ctx.Err()
+		case task = <-s.reqCh:
+			// request-driven task
 		case task, ok = <-s.taskCh:
 			if !ok {
+				// drain any straggler requests before retiring
+				for {
+					select {
+					case t := <-s.reqCh:
+						if err := s.sendChunk(ctx, ds, codec, t, &buf, &zbuf); err != nil {
+							_ = conn.Close()
+							return nil
+						}
+						continue
+					default:
+					}
+					break
+				}
 				_ = conn.Close()
 				return nil
 			}

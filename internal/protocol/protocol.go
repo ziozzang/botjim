@@ -166,6 +166,7 @@ const (
 	MsgError         uint8 = 0x33
 	MsgDone          uint8 = 0x34
 	MsgCommit        uint8 = 0x35 // sender→receiver: untrusted claim fully verified
+	MsgChunkRequest  uint8 = 0x36 // receiver→source: request-driven chunk fetch
 )
 
 // CtrlFrameFlags — control payload compression.
