@@ -25,6 +25,18 @@ func buildClientConfig(f *flags, addr string, alg uint8, resume uint8, owners at
 		dir = protocol.DirPull
 	}
 	reg := progress.New()
+	if f.dryRun {
+		p := preserveBits(f)
+		p |= protocol.PreserveDryRun
+		return session.ClientConfig{
+			Addr: addr, Direction: dir, Paths: paths, DestRoot: f.dest,
+			Compression: alg, ZstdLevel: compress.NormalizeZstdLevel(f.zstdLvl),
+			Parallel: f.parallel, Resume: resume, Preserve: p,
+			Fsync: !f.noFsync, OwnerPolicy: owners,
+			Token: f.token, Pass: f.pass,
+			Exclude: f.exclude, Include: f.include, LimitBPS: f.limitB,
+		}, reg
+	}
 	return session.ClientConfig{
 		Addr:        addr,
 		Direction:   dir,
@@ -37,6 +49,11 @@ func buildClientConfig(f *flags, addr string, alg uint8, resume uint8, owners at
 		Preserve:    preserveBits(f),
 		Fsync:       !f.noFsync,
 		OwnerPolicy: owners,
+		Token:       f.token,
+		Pass:        f.pass,
+		Exclude:     f.exclude,
+		Include:     f.include,
+		LimitBPS:    f.limitB,
 	}, reg
 }
 

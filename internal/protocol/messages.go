@@ -28,6 +28,7 @@ const (
 	PreserveDevices  uint16 = 1 << 3
 	PreserveUname    uint16 = 1 << 4
 	PreserveOwners   uint16 = 1 << 5
+	PreserveDryRun   uint16 = 1 << 6 // plan only: receiver reports haves, sends nothing
 )
 
 // InitTransfer opens a transfer on a session. Paths carries the pull-side
@@ -288,11 +289,16 @@ const (
 	HaveAllSkip uint8 = 2 // final file already matches (size+mtime)
 )
 
-// HaveBitmap tells the sender which chunks the receiver already has verified.
+// HaveBitmap tells the sender which chunks the receiver already has. When
+// the claim is trusted (a sidecar verified against the same source) Hashes
+// is empty; when the receiver adopted an existing file it cannot fully
+// trust (delta), Hashes carries one SHA-256 per claimed chunk and the
+// sender verifies each against its own bytes before skipping.
 type HaveBitmap struct {
 	FileID uint32
 	Status uint8
 	Bitmap []byte
+	Hashes [][32]byte
 }
 
 // Encode serializes m.
@@ -301,6 +307,10 @@ func (m HaveBitmap) Encode() []byte {
 	e.uv(uint64(m.FileID))
 	e.u8(m.Status)
 	e.bytes(m.Bitmap)
+	e.uv(uint64(len(m.Hashes)))
+	for _, h := range m.Hashes {
+		e.b = append(e.b, h[:]...)
+	}
 	return e.b
 }
 
@@ -312,6 +322,20 @@ func DecodeHaveBitmap(p []byte) (HaveBitmap, error) {
 	m.FileID = uint32(d.uv())
 	m.Status = d.u8()
 	m.Bitmap = d.bytes()
+	nh := d.uv()
+	if nh > 1<<20 {
+		return m, fmt.Errorf("too many have hashes: %d", nh)
+	}
+	for i := uint64(0); i < nh; i++ {
+		var h [32]byte
+		// hashes are fixed-width on the wire (no per-hash length prefix)
+		if len(d.b) < 32 {
+			return m, fmt.Errorf("short have hash")
+		}
+		copy(h[:], d.b[:32])
+		d.b = d.b[32:]
+		m.Hashes = append(m.Hashes, h)
+	}
 	return m, d.err
 }
 
@@ -502,6 +526,28 @@ func DecodeErrMsg(p []byte) (ErrMsg, error) {
 	m.Scope = d.u8()
 	m.Code = d.u16()
 	m.Msg = d.str()
+	return m, d.err
+}
+
+// Commit tells the receiver an untrusted have-claim (delta adoption)
+// verified in full — nothing will arrive for this file, finalize it.
+type Commit struct {
+	FileID uint32
+}
+
+// Encode serializes m.
+func (m Commit) Encode() []byte {
+	var e enc
+	e.uv(uint64(m.FileID))
+	return e.b
+}
+
+// DecodeCommit parses a Commit payload.
+func DecodeCommit(p []byte) (Commit, error) {
+	var d dec
+	d.b = p
+	var m Commit
+	m.FileID = uint32(d.uv())
 	return m, d.err
 }
 

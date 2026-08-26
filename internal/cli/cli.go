@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/ziozzang/botjim/internal/attrs"
@@ -57,8 +58,27 @@ type flags struct {
 	probe     bool
 	logFile   string
 	rest      []string
-	via       string // relay address for --via transfers
-	code      string // relay pairing code
+	via       string   // relay address for --via transfers
+	code      string   // relay pairing code
+	token     string   // shared-secret auth
+	pass      string   // passphrase record-layer encryption
+	limit     string   // bandwidth cap (e.g. 100M)
+	limitB    int64    // parsed
+	exclude   []string // walker exclusions
+	include   []string // walker inclusions (when set, only these)
+	dryRun    bool
+}
+
+// stringList is a repeatable string flag (--exclude a --exclude b).
+type stringList []string
+
+func (l *stringList) String() string     { return strings.Join(*l, ",") }
+func (l *stringList) Set(v string) error { *l = append(*l, v); return nil }
+
+// addFilterFlags registers --exclude/--include.
+func addFilterFlags(fs *flag.FlagSet, f *flags) {
+	fs.Var((*stringList)(&f.exclude), "exclude", "skip paths matching this glob (repeatable;\na bare name matches any component, 'a/b' matches the whole path)")
+	fs.Var((*stringList)(&f.include), "include", "transfer ONLY paths matching this glob (repeatable)")
 }
 
 // newFlagSet builds a command's parser with a usage header.

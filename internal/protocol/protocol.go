@@ -38,6 +38,13 @@ const (
 	CipherX25519ChaCha20 = 1 // reserved
 )
 
+// Handshake flag bits (byte 7). Auth/e2ee negotiate here; unknown flag
+// bits on either side must refuse the session (downgrade guard).
+const (
+	HSFlagToken = 1 << 0 // --token auth follows the handshake
+	HSFlagPass  = 1 << 1 // --pass record-layer encryption follows
+)
+
 // Handshake feature bits, exchanged as a u64 in the handshake. The effective
 // feature set for the session is the intersection.
 const (
@@ -128,7 +135,7 @@ func ReadHandshake(r io.Reader) (*Handshake, error) {
 	if buf[6] != CipherPlain {
 		return nil, fmt.Errorf("unsupported cipher id %d (this build speaks plaintext only)", buf[6])
 	}
-	if buf[7] != 0 {
+	if buf[7]&^(uint8(HSFlagToken|HSFlagPass)) != 0 {
 		return nil, fmt.Errorf("unsupported handshake flags %#x", buf[7])
 	}
 	h := &Handshake{
@@ -158,6 +165,7 @@ const (
 	MsgGoodbye       uint8 = 0x32
 	MsgError         uint8 = 0x33
 	MsgDone          uint8 = 0x34
+	MsgCommit        uint8 = 0x35 // sender→receiver: untrusted claim fully verified
 )
 
 // CtrlFrameFlags — control payload compression.

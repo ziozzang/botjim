@@ -16,6 +16,14 @@ import (
 // address, the server (for idle polling) and a stop function.
 func startTestServer(t *testing.T, root string, push, pull bool) (string, *Server, func()) {
 	t.Helper()
+	return startTestServerOpts(t, root, ServerConfig{
+		Root: root, AllowPush: push, AllowPull: pull, Parallel: 4, Fsync: true,
+	})
+}
+
+// startTestServerOpts is startTestServer with a full config.
+func startTestServerOpts(t *testing.T, root string, cfg ServerConfig) (string, *Server, func()) {
+	t.Helper()
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -23,13 +31,7 @@ func startTestServer(t *testing.T, root string, push, pull bool) (string, *Serve
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := NewServer(ServerConfig{
-		Root:      root,
-		AllowPush: push,
-		AllowPull: pull,
-		Parallel:  4,
-		Fsync:     true,
-	})
+	srv := NewServer(cfg)
 	done := make(chan struct{})
 	go func() { _ = srv.Serve(ln); close(done) }()
 	return ln.Addr().String(), srv, func() {

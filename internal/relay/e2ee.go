@@ -36,10 +36,21 @@ type e2eeKeys struct {
 	recvPrefix [4]byte
 }
 
+// EncryptConn wraps conn in the record layer after a PSK-authenticated
+// X25519 exchange. Direct mode (--pass) and swarm links reuse this with
+// secret material derived from a passphrase or swarm token.
+func EncryptConn(conn net.Conn, secret []byte, initiator bool) (net.Conn, error) {
+	return handshakeV1Secret(conn, secret, initiator)
+}
+
 // handshakeV1 performs the PSK-authenticated key exchange over the paired
 // pipe. initiator is the offering (sending) side. On success the returned
 // conn encrypts everything in both directions.
 func handshakeV1(conn net.Conn, code string, initiator bool) (net.Conn, error) {
+	return handshakeV1Secret(conn, []byte("botjim-relay-psk/v1/"+NormalizeCode(code)), initiator)
+}
+
+func handshakeV1Secret(conn net.Conn, psk []byte, initiator bool) (net.Conn, error) {
 	// ephemeral X25519
 	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
@@ -75,10 +86,9 @@ func handshakeV1(conn net.Conn, code string, initiator bool) (net.Conn, error) {
 		return nil, fmt.Errorf("relay handshake: %w", err)
 	}
 
-	// key schedule: X25519 shared secret + the code (as PSK). Both sides
-	// must derive identical output, so anything side-dependent enters only
-	// through the (symmetric) confirmation transcript below.
-	psk := []byte("botjim-relay-psk/v1/" + NormalizeCode(code))
+	// key schedule: X25519 shared secret + the PSK. Both sides must derive
+	// identical output, so anything side-dependent enters only through the
+	// (symmetric) confirmation transcript below.
 	ikm := append(append([]byte{}, shared...), psk...)
 	info := []byte(e2eeVersion)
 	var okm [64]byte

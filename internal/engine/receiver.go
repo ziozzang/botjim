@@ -80,6 +80,7 @@ type rxFile struct {
 	empty       bool
 	mu          sync.Mutex // guards sc/dirty/retries
 	retries     map[uint64]int
+	adopted     bool // final adopted as its own part (untrusted until Commit)
 }
 
 type hardlinkJob struct {
@@ -323,6 +324,12 @@ func (r *Receiver) readCtrl(ctx context.Context, cancel context.CancelFunc) erro
 				return err
 			}
 			r.senderFileError(m)
+		case protocol.MsgCommit:
+			m, err := protocol.DecodeCommit(payload)
+			if err != nil {
+				return err
+			}
+			r.commitFile(m.FileID)
 		case protocol.MsgCancel:
 			r.mu.Lock()
 			r.report.Cancelled = true
@@ -465,6 +472,12 @@ func (r *Receiver) prepareRegular(ctx context.Context, e manifest.Entry) {
 	}
 	grid := e.Grid()
 
+	// dry-run: report what a real run would do, touch nothing
+	if r.opts.Preserve&protocol.PreserveDryRun != 0 {
+		r.planFile(abs, e, grid)
+		return
+	}
+
 	// already-complete shortcut (size + mtime)
 	if fi, err := os.Lstat(abs); err == nil && fi.Mode().IsRegular() {
 		mtimeOK := r.opts.Resume == 1 || fi.ModTime().Equal(time.Unix(e.Mtime.Sec, int64(e.Mtime.Nsec)))
@@ -476,6 +489,13 @@ func (r *Receiver) prepareRegular(ctx context.Context, e manifest.Entry) {
 			r.pruneStaleParts(abs)
 			return
 		}
+	}
+
+	// delta: a same-size final with a different mtime becomes its own part —
+	// its chunks are re-hashed and only the differing ones arrive in place
+	if fi, err := os.Lstat(abs); err == nil && fi.Mode().IsRegular() && fi.Size() == e.Size && grid.Count() > 0 && r.opts.Resume != 2 {
+		r.adoptFinalAsPart(abs, e, grid)
+		return
 	}
 
 	// empty file: nothing streams, finalize inline
@@ -571,6 +591,125 @@ func (r *Receiver) prepareRegular(ctx context.Context, e manifest.Entry) {
 	if complete {
 		r.queueFinalize(e.ID)
 	}
+}
+
+// planFile answers a dry-run: hash an existing same-size final chunk-wise,
+// or report an empty bitmap, without touching the filesystem.
+func (r *Receiver) planFile(abs string, e manifest.Entry, grid chunking.Grid) {
+	if fi, err := os.Lstat(abs); err == nil && fi.Mode().IsRegular() && fi.Size() == e.Size {
+		mtimeOK := r.opts.Resume == 1 || fi.ModTime().Equal(time.Unix(e.Mtime.Sec, int64(e.Mtime.Nsec)))
+		if mtimeOK {
+			r.sendHave(e.ID, protocol.HaveAllSkip, nil)
+		} else {
+			fd, err := os.Open(abs)
+			if err == nil {
+				sc := sidecar.New(e, r.nonce)
+				r.hashInto(fd, e, grid, sc)
+				_ = fd.Close()
+				r.sendHave(e.ID, protocol.HavePartial, sc.Bitmap())
+			} else {
+				r.sendHave(e.ID, protocol.HavePartial, nil)
+			}
+		}
+		return
+	}
+	r.sendHave(e.ID, protocol.HavePartial, nil)
+}
+
+// hashInto rehashes a whole file into a fresh sidecar (dry-run and
+// final-adoption share it): non-zero chunks are claimed with their hashes,
+// zero chunks are left missing (unverifiable without the original).
+func (r *Receiver) hashInto(fd *os.File, e manifest.Entry, grid chunking.Grid, sc *sidecar.Sidecar) {
+	buf := make([]byte, grid.ChunkSize)
+	for i := int64(0); i < grid.Count(); i++ {
+		n := grid.Len(i)
+		if int64(cap(buf)) < n {
+			buf = make([]byte, n)
+		}
+		chunk := buf[:n]
+		got, err := fd.ReadAt(chunk, grid.Offset(i))
+		if err != nil && !errors.Is(err, io.EOF) {
+			continue
+		}
+		if int64(got) != n {
+			continue
+		}
+		if chunking.AllZero(chunk) {
+			continue
+		}
+		h := chunking.ChunkSHA(e.RelPath, i, chunk)
+		sc.SetHave(i, h, false)
+	}
+}
+
+// adoptFinalAsPart turns an existing same-size final file into the
+// transfer's own part: chunks are re-hashed, differing ones arrive in
+// place, and finalize skips the rename (the file is already at home). A
+// crash mid-delta leaves a torn final + sidecar, which resume repairs.
+func (r *Receiver) adoptFinalAsPart(abs string, e manifest.Entry, grid chunking.Grid) {
+	fd, err := os.OpenFile(abs, os.O_RDWR, 0)
+	if err != nil {
+		// read-only or busy: fall through to a fresh part
+		return
+	}
+	sc := sidecar.New(e, r.nonce)
+	r.hashInto(fd, e, grid, sc)
+	f := &rxFile{entry: e, abs: abs, partPath: abs, part: fd, sc: sc, retries: map[uint64]int{}}
+	r.mu.Lock()
+	r.files[e.ID] = f
+	r.mu.Unlock()
+
+	// the claim is untrusted (the source changed since this file was
+	// written): attach the hashes so the sender verifies before skipping
+	var hashes [][32]byte
+	for i := int64(0); i < grid.Count(); i++ {
+		if sc.Have(i) {
+			hexs := sc.Hashes[i]
+			if raw, ok := unhex32(hexs); ok {
+				hashes = append(hashes, raw)
+			} else {
+				hashes = append(hashes, chunking.ZeroHash)
+			}
+		}
+	}
+	r.sendHaveHashes(e.ID, protocol.HavePartial, sc.Bitmap(), hashes)
+
+	if resumed := sc.HaveCount() * grid.ChunkSize; resumed > 0 {
+		r.reg.FileDoneBytes(e.ID, resumed) // optimistic; corrected by what arrives
+	}
+	r.reg.FileStateUpdate(e.ID, "active", "")
+	// deliberately NOT finalizing on sc.Complete(): the claim is untrusted,
+	// so completion means either chunks arrive (maybeComplete fires) or the
+	// sender sends Commit (fully verified)
+	f.adopted = true
+}
+
+func unhex32(s string) ([32]byte, bool) {
+	var out [32]byte
+	if len(s) != 64 {
+		return out, false
+	}
+	for i := 0; i < 32; i++ {
+		hi := hexVal(s[i*2])
+		lo := hexVal(s[i*2+1])
+		if hi < 0 || lo < 0 {
+			return out, false
+		}
+		out[i] = byte(hi<<4 | lo)
+	}
+	return out, true
+}
+
+func hexVal(c byte) int {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0')
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10
+	case c >= 'A' && c <= 'F':
+		return int(c-'A') + 10
+	}
+	return -1
 }
 
 // rehashPart re-verifies every have-marked chunk of a resumed part. When
@@ -873,9 +1012,11 @@ func (r *Receiver) finalize(id uint32) {
 		r.failFile(f, CodeIO, "sidecar: "+serr.Error())
 		return
 	}
-	if err := os.Rename(f.partPath, f.abs); err != nil {
-		r.failFile(f, CodeIO, "rename: "+err.Error())
-		return
+	if f.partPath != f.abs { // delta adoption is already at the final path
+		if err := os.Rename(f.partPath, f.abs); err != nil {
+			r.failFile(f, CodeIO, "rename: "+err.Error())
+			return
+		}
 	}
 	_ = os.Remove(sidecar.MetaPathForPart(f.partPath))
 	r.forgetParts(f.abs, filepath.Base(f.partPath))
@@ -1063,6 +1204,10 @@ func (r *Receiver) sendHave(fileID uint32, status uint8, bitmap []byte) {
 	_ = r.ctrl.Send(protocol.MsgHaveBitmap, 0, protocol.HaveBitmap{FileID: fileID, Status: status, Bitmap: bitmap}.Encode())
 }
 
+func (r *Receiver) sendHaveHashes(fileID uint32, status uint8, bitmap []byte, hashes [][32]byte) {
+	_ = r.ctrl.Send(protocol.MsgHaveBitmap, 0, protocol.HaveBitmap{FileID: fileID, Status: status, Bitmap: bitmap, Hashes: hashes}.Encode())
+}
+
 // okEntry records success and echoes FileResult.
 func (r *Receiver) okEntry(e manifest.Entry, _ string) {
 	r.mu.Lock()
@@ -1147,6 +1292,23 @@ func (r *Receiver) senderFileError(m protocol.FileResult) {
 	r.mu.Unlock()
 	r.reg.FileStateUpdate(m.FileID, "error", m.Msg)
 	r.kickCompletion()
+}
+
+// commitFile finalizes an adopted file whose claims all verified.
+func (r *Receiver) commitFile(id uint32) {
+	r.mu.Lock()
+	f := r.files[id]
+	r.mu.Unlock()
+	if f == nil || f.resolved || f.errored {
+		return
+	}
+	f.mu.Lock()
+	if !f.sc.Complete() {
+		f.mu.Unlock()
+		return // chunks are still coming
+	}
+	f.mu.Unlock()
+	r.queueFinalize(id)
 }
 
 // retryOrFail sends a ChunkRetry or escalates to a file error after three

@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ziozzang/botjim/internal/chunking"
 	"github.com/ziozzang/botjim/internal/compress"
 	"github.com/ziozzang/botjim/internal/fsutil"
 	"github.com/ziozzang/botjim/internal/manifest"
@@ -46,6 +47,9 @@ type Sender struct {
 
 	taskCh  chan chunkTask
 	kick    chan struct{}
+	limiter *limiter
+	dryRun  bool
+	plan    []PlanRow
 	readyQ  []uint32 // gate-opened files awaiting task enqueue
 	report  Report
 	batchMu sync.Mutex
@@ -76,6 +80,15 @@ type txFile struct {
 	resolved bool
 }
 
+// PlanRow is one file's dry-run verdict.
+type PlanRow struct {
+	Path   string
+	Size   int64
+	Chunks int64
+	Have   int64 // chunks already at the destination
+	Status string
+}
+
 // NewSender builds a sender core.
 func NewSender(sess *transport.Session, ctrl *protocol.CtrlStream, opts Options, reg *progress.Registry, roots []string) *Sender {
 	s := &Sender{
@@ -88,7 +101,22 @@ func NewSender(sess *transport.Session, ctrl *protocol.CtrlStream, opts Options,
 		ctrlDone:    make(chan struct{}),
 	}
 	s.gateCond = sync.NewCond(&s.mu)
+	if opts.LimitBPS > 0 {
+		s.limiter = newLimiter(opts.LimitBPS)
+	}
+	if p := opts.Preserve; p&protocol.PreserveDryRun != 0 {
+		s.dryRun = true
+	}
 	return s
+}
+
+// Plan returns the dry-run rows (only after Run completes with --dry-run).
+func (s *Sender) Plan() []PlanRow {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]PlanRow, len(s.plan))
+	copy(out, s.plan)
+	return out
 }
 
 // Run drives the sender until the transfer completes, is cancelled, or dies.
@@ -216,6 +244,8 @@ func (s *Sender) walkOpts() manifest.WalkOpts {
 		Hardlinks:  p&protocol.PreserveHardlink != 0,
 		Devices:    p&protocol.PreserveDevices != 0,
 		UnameGname: p&protocol.PreserveUname != 0,
+		Exclude:    s.opts.Exclude,
+		Include:    s.opts.Include,
 	}
 }
 
@@ -382,6 +412,7 @@ func (s *Sender) gateOpen(m protocol.HaveBitmap) {
 		return
 	}
 	waiting := f.have == nil && !f.allSkip
+	haveCount := int64(0)
 	switch m.Status {
 	case protocol.HaveAllSkip:
 		f.allSkip = true
@@ -391,6 +422,20 @@ func (s *Sender) gateOpen(m protocol.HaveBitmap) {
 		// the decoded payload aliases the control reader's reusable buffer:
 		// copy the bitmap before the next frame overwrites it
 		f.have = append([]byte(nil), m.Bitmap...)
+		for _, b := range f.have {
+			haveCount += int64(popcount8(b))
+		}
+		if len(m.Hashes) > 0 {
+			// untrusted claim (delta adoption): verify each claimed chunk
+			// against our own bytes, clear the mismatches
+			cleared := s.verifyClaims(f, m.Hashes)
+			haveCount -= cleared
+			if cleared == 0 {
+				// every claim verified: nothing will arrive, tell the
+				// receiver to finalize the adopted file
+				_ = s.ctrl.Send(protocol.MsgCommit, 0, protocol.Commit{FileID: m.FileID}.Encode())
+			}
+		}
 	case protocol.HaveNone:
 		f.have = []byte{}
 	}
@@ -398,11 +443,90 @@ func (s *Sender) gateOpen(m protocol.HaveBitmap) {
 		s.gatesOpen--
 		s.gateCond.Signal()
 	}
+	if s.dryRun {
+		row := PlanRow{Path: f.entry.RelPath, Size: f.entry.Size, Chunks: f.count, Have: haveCount, Status: "send"}
+		if f.allSkip {
+			row.Status = "skip"
+			row.Have = f.count
+		}
+		s.plan = append(s.plan, row)
+		// resolve immediately (under the lock): no data will flow
+		if !f.errored && !f.resolved {
+			f.resolved = true
+			s.resolved++
+			s.report.Files++
+		}
+		s.mu.Unlock()
+		s.reg.FileStateUpdate(f.entry.ID, "done", "")
+		return
+	}
 	if !f.errored && !f.resolved && !f.allSkip {
 		s.readyQ = append(s.readyQ, m.FileID)
 	}
 	s.mu.Unlock()
 	s.kickScheduler()
+}
+
+// verifyClaims re-hashes the sender's own claimed chunks and clears
+// have-bits whose hash differs from the receiver's claim. Returns the
+// number of cleared bits (claimed chunks that will be re-sent).
+func (s *Sender) verifyClaims(f *txFile, hashes [][32]byte) int64 {
+	grid := f.entry.Grid()
+	e := f.entry
+	fd, err := fsutil.OpenNoAtime(e.AbsPath)
+	if err != nil {
+		return 0 // cannot verify: trust nothing, clear all
+	}
+	defer fd.Close()
+	buf := make([]byte, grid.ChunkSize)
+	cleared := int64(0)
+	claimed := 0
+	for i := int64(0); i < grid.Count() && claimed < len(hashes); i++ {
+		if !bitTest(f.have, i) {
+			continue
+		}
+		h := hashes[claimed]
+		claimed++
+		n := grid.Len(i)
+		if int64(cap(buf)) < n {
+			buf = make([]byte, n)
+		}
+		chunk := buf[:n]
+		got, err := fd.ReadAt(chunk, grid.Offset(i))
+		if err != nil && !errors.Is(err, io.EOF) || int64(got) != n {
+			clearBit(f.have, i)
+			cleared++
+			continue
+		}
+		if chunking.ChunkSHA(e.RelPath, i, chunk) != h {
+			clearBit(f.have, i)
+			cleared++
+		}
+	}
+	// any claims beyond our count are protocol junk: clear remaining bits
+	for i := int64(0); i < grid.Count() && claimed < len(hashes); i++ {
+		if bitTest(f.have, i) {
+			clearBit(f.have, i)
+			cleared++
+			claimed++
+		}
+	}
+	return cleared
+}
+
+func clearBit(bitmap []byte, i int64) {
+	if i/8 < int64(len(bitmap)) {
+		bitmap[i/8] &^= 1 << (uint(i) % 8)
+	}
+}
+
+func popcount8(b byte) int {
+	n := 0
+	for b != 0 {
+		b &= b - 1
+		n++
+	}
+	return n
 }
 
 // fileResult resolves an entry by receiver echo.
@@ -713,6 +837,9 @@ func (s *Sender) sendChunk(ctx context.Context, ds *protocol.DataStream, codec c
 		s.reg.AddSent(n)
 		s.reg.FileDoneBytes(e.ID, n)
 		s.reg.FileStateUpdate(e.ID, "active", "")
+		if err := s.limiter.acquire(ctx, n); err != nil {
+			return err
+		}
 		return ds.WriteChunk(protocol.ChunkHeader{FileID: e.ID, ChunkIdx: uint64(task.idx), Flags: protocol.ChunkFlagZero, PayloadLen: 0}, nil)
 	}
 	if codec != nil {
@@ -731,6 +858,9 @@ func (s *Sender) sendChunk(ctx context.Context, ds *protocol.DataStream, codec c
 	s.reg.AddSent(n)
 	s.reg.FileDoneBytes(e.ID, n)
 	s.reg.FileStateUpdate(e.ID, "active", "")
+	if err := s.limiter.acquire(ctx, n); err != nil {
+		return err
+	}
 	return ds.WriteChunk(protocol.ChunkHeader{FileID: e.ID, ChunkIdx: uint64(task.idx), Flags: flags, PayloadLen: uint64(len(payload))}, payload)
 }
 

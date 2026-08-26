@@ -24,8 +24,16 @@ import (
 	"github.com/ziozzang/botjim/internal/fsutil"
 	"github.com/ziozzang/botjim/internal/progress"
 	"github.com/ziozzang/botjim/internal/protocol"
+	"github.com/ziozzang/botjim/internal/relay"
 	"github.com/ziozzang/botjim/internal/transport"
 )
+
+// Wire the record-layer hooks once: every botjim process (and test) that
+// uses sessions gets --pass encryption via the relay's proven construction.
+func init() {
+	transport.CipherFactory = relay.EncryptConn
+	transport.PassphraseSecret = relay.PassphraseSecret
+}
 
 // ServerConfig configures a listening server.
 type ServerConfig struct {
@@ -36,6 +44,11 @@ type ServerConfig struct {
 	AllowPush   bool
 	AllowPull   bool
 	Features    uint64
+	Token       string   // require --token auth from clients
+	Pass        string   // require record-layer encryption from clients
+	Exclude     []string // walker exclusions
+	Include     []string // walker inclusions
+	LimitBPS    int64    // send-rate cap (0 = unlimited)
 }
 
 // Server accepts connections and runs receiver/sender cores per session.
@@ -130,7 +143,7 @@ func (s *Server) ServeConn(raw net.Conn) { s.handleConn(raw) }
 
 func (s *Server) handleConn(raw net.Conn) {
 	remote := raw.RemoteAddr().String()
-	sess, err := transport.Accept(raw, s.cfg.Features, nil)
+	sess, err := transport.AcceptSec(raw, s.cfg.Features, nil, transport.SecOpts{Token: s.cfg.Token, Pass: s.cfg.Pass})
 	if err != nil {
 		s.Log("%s handshake: %v", remote, err)
 		_ = raw.Close()
@@ -257,6 +270,9 @@ func (s *Server) runTransfer(sess *transport.Session, ctrl *protocol.CtrlStream,
 		Fsync:       s.cfg.Fsync,
 		OwnerPolicy: s.cfg.OwnerPolicy,
 		Nonce:       sess.HS.NonceHex(),
+		Exclude:     s.cfg.Exclude,
+		Include:     s.cfg.Include,
+		LimitBPS:    s.cfg.LimitBPS,
 	}
 	reg := progress.New()
 	s.mu.Lock()
@@ -357,7 +373,12 @@ func (s *Server) serveList(ctrl *protocol.CtrlStream, payload []byte) {
 type ClientConfig struct {
 	Addr        string
 	Conn        net.Conn // pre-paired connection (relay); Addr is display-only then
-	Direction   uint8    // protocol.DirPush / DirPull
+	Token       string
+	Pass        string
+	Exclude     []string
+	Include     []string
+	LimitBPS    int64
+	Direction   uint8 // protocol.DirPush / DirPull
 	Paths       []string
 	DestRoot    string // pull destination (client side)
 	Compression uint8
@@ -373,6 +394,7 @@ type ClientConfig struct {
 // ClientResult is what a client run produced.
 type ClientResult struct {
 	Report engine.Report
+	Plan   []engine.PlanRow // dry-run rows (Populated with --dry-run)
 	Err    error
 }
 
@@ -385,10 +407,11 @@ func RunTransfer(ctx context.Context, cfg ClientConfig) ClientResult {
 func RunWithProgress(ctx context.Context, cfg ClientConfig, reg *progress.Registry) ClientResult {
 	var sess *transport.Session
 	var err error
+	sec := transport.SecOpts{Token: cfg.Token, Pass: cfg.Pass}
 	if cfg.Conn != nil {
-		sess, err = transport.DialConn(cfg.Conn, protocol.FeatAll, nil)
+		sess, err = transport.DialConnSec(cfg.Conn, protocol.FeatAll, nil, sec)
 	} else {
-		sess, err = transport.Dial(ctx, cfg.Addr, protocol.FeatAll, nil)
+		sess, err = transport.DialSec(ctx, cfg.Addr, protocol.FeatAll, nil, sec)
 	}
 	if err != nil {
 		return ClientResult{Err: err}
@@ -453,12 +476,15 @@ func RunWithProgress(ctx context.Context, cfg ClientConfig, reg *progress.Regist
 		Fsync:       cfg.Fsync,
 		OwnerPolicy: cfg.OwnerPolicy,
 		Nonce:       sess.HS.NonceHex(),
+		Exclude:     cfg.Exclude,
+		Include:     cfg.Include,
+		LimitBPS:    cfg.LimitBPS,
 	}
 
 	if cfg.Direction == protocol.DirPush {
 		sender := engine.NewSender(sess, ctrl, opts, reg, cfg.Paths)
 		report, err := sender.Run(ctx)
-		return ClientResult{Report: report, Err: err}
+		return ClientResult{Report: report, Plan: sender.Plan(), Err: err}
 	}
 
 	if err := os.MkdirAll(cfg.DestRoot, 0o755); err != nil {

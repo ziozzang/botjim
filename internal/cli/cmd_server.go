@@ -27,6 +27,8 @@ func cmdServer(args []string) int {
 	fs.StringVar(&f.owners, "map-owners", "none", "ownership policy for received files:\nnone | numeric | name")
 	fs.IntVar(&f.parallel, "parallel", 8, "max data streams per connection (caps client requests)")
 	fs.BoolVar(&f.noFsync, "no-fsync", false, "skip fsync before finalize")
+	fs.StringVar(&f.token, "token", "", "require this shared-secret token from clients")
+	fs.StringVar(&f.pass, "pass", "", "require record-layer encryption with this passphrase\n(clients must use the same --pass)")
 	addCommonFlags(fs, f)
 	if err := fs.Parse(args); err != nil {
 		if parseHelp(err) {
@@ -82,6 +84,8 @@ func runServer(ctx context.Context, f *flags, owners attrs.OwnerPolicy) error {
 		OwnerPolicy: owners,
 		AllowPush:   true,
 		AllowPull:   true,
+		Token:       f.token,
+		Pass:        f.pass,
 	})
 	fmt.Fprintf(os.Stderr, "botjim %s serving %s on %s (plain V1 — use on trusted networks)\n", version.Version, root, bind)
 

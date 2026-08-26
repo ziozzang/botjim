@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -19,7 +20,9 @@ func startBroker(t *testing.T) (addr string, stop func()) {
 		t.Fatal(err)
 	}
 	b := NewBroker()
-	b.Logger = func(f string, a ...any) { t.Logf("broker: "+f, a...) }
+	// log to stdout: broker goroutines outlive the test, and t.Logf after
+	// test completion trips the race detector
+	b.Logger = func(f string, a ...any) { fmt.Printf("broker: "+f+"\n", a...) }
 	done := make(chan struct{})
 	go func() { _ = b.Serve(ln); close(done) }()
 	return ln.Addr().String(), func() {

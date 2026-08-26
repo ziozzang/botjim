@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"os/user"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -105,11 +106,32 @@ func (e Entry) Grid() chunking.Grid { return chunking.Grid{Size: e.Size, ChunkSi
 
 // WalkOpts controls what the walker emits.
 type WalkOpts struct {
-	Xattrs     bool // read extended attributes
-	Hardlinks  bool // detect hardlinks (else duplicates become full copies)
-	Devices    bool // emit fifo/device nodes (else skip with a warning)
-	OneFS      bool // do not cross filesystem boundaries
-	UnameGname bool // resolve uid/gid to names (cached lookups)
+	Xattrs     bool     // read extended attributes
+	Hardlinks  bool     // detect hardlinks (else duplicates become full copies)
+	Devices    bool     // emit fifo/device nodes (else skip with a warning)
+	OneFS      bool     // do not cross filesystem boundaries
+	UnameGname bool     // resolve uid/gid to names (cached lookups)
+	Exclude    []string // glob patterns to skip (matched on basename or rel path)
+	Include    []string // when set, only matching paths are kept
+}
+
+// excluded reports whether rel matches any of pats. A pattern with a '/'
+// matches the whole relative path; a bare name matches any component.
+func excluded(rel string, pats []string) bool {
+	for _, pat := range pats {
+		if strings.Contains(pat, "/") {
+			if ok, _ := path.Match(pat, rel); ok {
+				return true
+			}
+			continue
+		}
+		for _, comp := range strings.Split(rel, "/") {
+			if ok, _ := path.Match(pat, comp); ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Skipped records something the walker declined to transfer.
@@ -283,6 +305,14 @@ func (w *Walker) walkDir(ctx context.Context, path, rel string, emit func(Entry)
 		childRel := name
 		if rel != "." {
 			childRel = rel + "/" + name
+		}
+		if len(w.Opts.Exclude) > 0 && excluded(childRel, w.Opts.Exclude) {
+			w.skip(child, "excluded by --exclude")
+			continue
+		}
+		if len(w.Opts.Include) > 0 && !excluded(childRel, w.Opts.Include) {
+			w.skip(child, "not matched by --include")
+			continue
 		}
 		ci, err := byName[name].Info()
 		if err != nil {

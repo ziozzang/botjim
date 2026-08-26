@@ -62,14 +62,42 @@ func muxConfig() *yamux.Config {
 	return cfg
 }
 
+func deadlineAuth() time.Time { return time.Now().Add(20 * time.Second) }
+
+var noDeadline = time.Time{}
+
 // Session wraps a yamux session.
 type Session struct {
 	ys *yamux.Session
 	HS *protocol.Handshake // peer's handshake (post-intersection features)
 }
 
+// SecOpts carries the optional security layers applied right after the
+// handshake: a shared-secret token (mutual proof-of-knowledge) and a
+// passphrase record layer. Zero values disable both.
+type SecOpts struct {
+	Token string
+	Pass  string
+}
+
+func (o SecOpts) flags() uint8 {
+	var f uint8
+	if o.Token != "" {
+		f |= protocol.HSFlagToken
+	}
+	if o.Pass != "" {
+		f |= protocol.HSFlagPass
+	}
+	return f
+}
+
 // Dial connects, handshakes as client and multiplexes.
 func Dial(ctx context.Context, addr string, features uint64, cipher CipherFunc) (*Session, error) {
+	return DialSec(ctx, addr, features, cipher, SecOpts{})
+}
+
+// DialSec is Dial with token auth / passphrase encryption.
+func DialSec(ctx context.Context, addr string, features uint64, cipher CipherFunc, sec SecOpts) (*Session, error) {
 	if cipher == nil {
 		cipher = IdentityCipher
 	}
@@ -78,13 +106,28 @@ func Dial(ctx context.Context, addr string, features uint64, cipher CipherFunc) 
 	if err != nil {
 		return nil, err
 	}
-	return DialConn(raw, features, cipher)
+	return DialConnSec(raw, features, cipher, sec)
 }
 
 // DialConn handshakes as the client over an already-established
 // connection (relay mode hands in a paired, encrypted conn here — so the
 // FSY1 handshake itself travels inside the record layer).
 func DialConn(raw net.Conn, features uint64, cipher CipherFunc) (*Session, error) {
+	return DialConnSec(raw, features, cipher, SecOpts{})
+}
+
+// CipherFactory builds the record layer from a shared secret; the relay
+// package installs its implementation, keeping transport dependency-free.
+var CipherFactory func(raw net.Conn, secret []byte, initiator bool) (net.Conn, error)
+
+// PassphraseSecret stretches a passphrase into a PSK (both sides derive
+// the same bytes; per-session randomness comes from the record-layer
+// exchange itself, so a fixed domain salt is correct here — it only sets
+// the attacker's per-guess cost).
+var PassphraseSecret func(pass string) []byte
+
+// DialConnSec is DialConn with the security options applied inline.
+func DialConnSec(raw net.Conn, features uint64, cipher CipherFunc, sec SecOpts) (*Session, error) {
 	if cipher == nil {
 		cipher = IdentityCipher
 	}
@@ -94,6 +137,7 @@ func DialConn(raw net.Conn, features uint64, cipher CipherFunc) (*Session, error
 		_ = raw.Close()
 		return nil, err
 	}
+	hs.Flags |= sec.flags()
 	if err := protocol.WriteHandshake(raw, hs); err != nil {
 		_ = raw.Close()
 		return nil, err
@@ -103,6 +147,12 @@ func DialConn(raw net.Conn, features uint64, cipher CipherFunc) (*Session, error
 		_ = raw.Close()
 		return nil, fmt.Errorf("server handshake: %w", err)
 	}
+	secured, serr := secureConn(raw, hs, peerRaw, sec, true)
+	if serr != nil {
+		_ = raw.Close()
+		return nil, serr
+	}
+	raw = secured
 	_ = raw.SetDeadline(time.Time{})
 	wire, err := cipher(raw)
 	if err != nil {
@@ -124,11 +174,22 @@ type HandshakeResult struct {
 
 // Accept handshakes one inbound connection (server side).
 func Accept(raw net.Conn, features uint64, cipher CipherFunc) (*Session, error) {
-	return AcceptConn(raw, features, cipher)
+	return AcceptConnSec(raw, features, cipher, SecOpts{})
 }
 
 // AcceptConn is Accept for an already-established connection (relay).
 func AcceptConn(raw net.Conn, features uint64, cipher CipherFunc) (*Session, error) {
+	return AcceptConnSec(raw, features, cipher, SecOpts{})
+}
+
+// AcceptSec is Accept with token auth / passphrase encryption. A server
+// with a token set refuses clients that did not request auth.
+func AcceptSec(raw net.Conn, features uint64, cipher CipherFunc, sec SecOpts) (*Session, error) {
+	return AcceptConnSec(raw, features, cipher, sec)
+}
+
+// AcceptConnSec is AcceptConn with the security options applied inline.
+func AcceptConnSec(raw net.Conn, features uint64, cipher CipherFunc, sec SecOpts) (*Session, error) {
 	if cipher == nil {
 		cipher = IdentityCipher
 	}
@@ -143,10 +204,18 @@ func AcceptConn(raw net.Conn, features uint64, cipher CipherFunc) (*Session, err
 		_ = raw.Close()
 		return nil, fmt.Errorf("client handshake: %w", err)
 	}
+	// announce the layers we require; refuse mismatched expectations
+	hs.Flags |= sec.flags()
 	if err := protocol.WriteHandshake(raw, hs); err != nil {
 		_ = raw.Close()
 		return nil, err
 	}
+	secured, serr := secureConn(raw, hs, peer, sec, false)
+	if serr != nil {
+		_ = raw.Close()
+		return nil, serr
+	}
+	raw = secured
 	_ = raw.SetDeadline(time.Time{})
 	wire, err := cipher(raw)
 	if err != nil {
@@ -159,6 +228,52 @@ func AcceptConn(raw net.Conn, features uint64, cipher CipherFunc) (*Session, err
 		return nil, err
 	}
 	return &Session{ys: ys, HS: negotiate(hs, peer)}, nil
+}
+
+// secureConn runs the negotiated post-handshake layers and returns the
+// (possibly wrapped) connection: token proof first, then the passphrase
+// record layer, which must wrap before yamux so even the multiplexed
+// headers are ciphertext.
+func secureConn(raw net.Conn, mine, theirs *protocol.Handshake, sec SecOpts, client bool) (net.Conn, error) {
+	wantToken := mine.Flags&protocol.HSFlagToken != 0
+	gotToken := theirs.Flags&protocol.HSFlagToken != 0
+	switch {
+	case wantToken && !gotToken:
+		if client {
+			return nil, fmt.Errorf("server does not use --token auth")
+		}
+		return nil, fmt.Errorf("token required: client did not authenticate")
+	case gotToken && !wantToken:
+		if client {
+			return nil, fmt.Errorf("server requires --token auth (pass the same token)")
+		}
+		return nil, fmt.Errorf("client sent --token but this server has none")
+	}
+	if wantToken {
+		if err := TokenAuth(raw, mine, theirs, sec.Token, client); err != nil {
+			return nil, err
+		}
+	}
+	// passphrase: both sides must agree
+	wantPass := mine.Flags&protocol.HSFlagPass != 0
+	gotPass := theirs.Flags&protocol.HSFlagPass != 0
+	if wantPass != gotPass {
+		if wantPass {
+			return nil, fmt.Errorf("encryption required: client connected in plaintext")
+		}
+		return nil, fmt.Errorf("client wants encryption but this server has no --pass")
+	}
+	if wantPass {
+		if CipherFactory == nil || PassphraseSecret == nil {
+			return nil, fmt.Errorf("encryption unavailable (build missing record layer)")
+		}
+		wrapped, err := CipherFactory(raw, PassphraseSecret(sec.Pass), client)
+		if err != nil {
+			return nil, fmt.Errorf("encryption: %w", err)
+		}
+		return wrapped, nil
+	}
+	return raw, nil
 }
 
 // readHandshakeStrict reads the peer's handshake and performs a hard
